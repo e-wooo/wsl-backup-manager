@@ -1,38 +1,24 @@
-# WSL Backup Manager v4.01
+# WSL Backup Manager v4.1
 # Description: Windows PowerShell / WSL2 backup and restore utility.
 # Environment: Windows 10/11 (PowerShell 5.1 & Core 7+)
-# Collaboration: GPT-5.5 and GLM-5.1.
-# Release date: 2026-05-04
+# Collaboration: Claude Opus 4.7 and GPT-5.5.
+# Release date: 2026-05-11
+# Runtime version is defined by Get-WSLBMScriptVersion.
 #
-# Current Candidate Summary (v3.23 baseline -> v4.01):
-#   - Evolved from the original v3.23 Windows-side WSL2 backup script into a
-#     guarded Windows PowerShell / WSL2 backup and restore utility.
-#   - FULL backup and restore no longer use cmd.exe or batch pipe chains; they
-#     use controlled temp tar files and separate WSL / 7-Zip process steps.
-#   - High-risk WSL operations are routed through guarded wrappers or checked
-#     process paths with exit-code handling and DryRun short-circuiting.
-#   - FULL overwrite restore requires Safety Net creation, manifest/archive
-#     consistency checks, BasePath-aware install targeting, and exact destructive
-#     confirmation before unregister/import operations.
-#   - DryRun previews covered high-risk operations without running real WSL,
-#     7z, delete, overwrite, restore, manifest-write, or archive-write actions.
-#   - Manifests record SHA256, archive size, OperationId, status, and audit data;
-#     restore flows display and check manifest/archive consistency.
-#   - Delete operations are centralized in a protected delete helper with root,
-#     shape, audit, and reparse-point checks.
-#   - Diagnostics are read-only environment self-checks.
+# Current Version Summary (v4.01 -> v4.1):
+#   - Static review driven hardening on the git-tracked v4.01 baseline.
+#   - Strengthens FULL overwrite restore safeguards with Safety Net manifest
+#     tracking, rollback confirmation, and improved disk/UNC preflight checks.
+#   - Consolidates WSL / 7-Zip native process handling with safer argument
+#     passing, timeout, cancel, and separated stdout/stderr capture.
+#   - Improves archive/manifest verification, logging, UTF-8 text output,
+#     lock-file cleanup reporting, backup table visibility, 7z PATH handling,
+#     Close-VSCodeSafely matching, read-only WSL probes, DryRun behavior, and
+#     real command path handling.
 #
-# Historical Stage: v4.00 Safety Hardening Baseline:
-#   - Established DryRun, guarded WSL boundaries, temp-tar FULL flows, mandatory
-#     overwrite Safety Net, protected delete, manifest audit, path validation,
-#     and USER/CUSTOM metadata-fidelity warnings.
-#
-# v4.01 Stabilization:
-#   - Stabilization, polish, and safety edge-case fixes on the v4.00 baseline;
-#     this is not a large feature or format redesign.
-#   - Tightens visible backup selection, restore DryRun wording, config path
-#     fail-closed behavior, .wslconfig handling, 7-Zip process tracking, and
-#     minor path edge cases.
+# Historical Baseline:
+#   - v4.01 was the safety-hardened candidate derived from the v3.23 Windows-side
+#     WSL2 backup script and v4.00 safety hardening baseline.
 #
 # Known Limitations:
 #   - USER/CUSTOM backups remain convenience directory backups via WSL UNC paths
@@ -67,8 +53,16 @@ $Global:BackupState = @{
 
 $Global:ConfigPath = Join-Path $PSScriptRoot "wsl-backup-config.json"
 $Global:LogRoot = Join-Path $PSScriptRoot "logs"
+$Script:WSLBMScriptVersion = "v4.1"
+$Script:WSLBMScriptDate = "2026-05-11"
 $Script:CurrentDistro = $null
 $Script:WSLPathPrefix = "\\wsl.localhost"
+$Script:DefaultWSLCommandTimeoutSeconds = 14400
+$Script:RestoreExtractTimeoutSeconds = 14400
+$Script:ReadOnlyWSLProbeTimeoutSeconds = 30
+$Script:SevenZipIntegrityTimeoutSeconds = 14400
+$Script:MinimumSafetyNetArchiveBytes = 16MB
+$Script:MinimumSafetyNetFreeSpaceBytes = 5GB
 
 $Global:Config = @{
     GlobalBackupRoot = (Join-Path $PSScriptRoot "Backups")
@@ -437,7 +431,7 @@ function Get-Optimal7zThreads {
         [int]$Level
     )
 
-    Write-Host "`n[Pre-Flight Resource Check] v4.01 Conservative Model" -ForegroundColor Cyan
+    Write-Host "`n[Pre-Flight Resource Check] $(Get-WSLBMScriptVersion) Conservative Model" -ForegroundColor Cyan
 
     try {
         $os = Get-CimInstance Win32_OperatingSystem | Select-Object -First 1
@@ -828,6 +822,78 @@ function Show-ManifestAuditInfo {
     Write-Host ""
 }
 
+function Get-WSLBMFileSha256WithProgress {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Alias("Path")]
+        [string]$LiteralPath,
+
+        [string]$Activity = "Computing SHA256",
+
+        [bool]$AllowCancel = $true,
+
+        [int]$ProgressId = 4101
+    )
+
+    $item = Get-Item -LiteralPath $LiteralPath -ErrorAction Stop
+    if ($item.PSIsContainer) {
+        throw "SHA256 input is a directory: $LiteralPath"
+    }
+    if ($item.Length -le 0) {
+        throw "SHA256 input is empty: $LiteralPath"
+    }
+
+    $sha256 = $null
+    $stream = $null
+    $bufferSize = 4MB
+    $buffer = New-Object byte[] $bufferSize
+    $emptyBuffer = New-Object byte[] 0
+    $totalBytes = [long]$item.Length
+    $readBytes = [long]0
+    $cancelStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $stream = [System.IO.File]::OpenRead($item.FullName)
+
+        while ($true) {
+            $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
+            if ($bytesRead -le 0) {
+                break
+            }
+
+            $null = $sha256.TransformBlock($buffer, 0, $bytesRead, $buffer, 0)
+            $readBytes += [long]$bytesRead
+            $percent = [math]::Min(99, [int](($readBytes * 100.0) / $totalBytes))
+            $status = "{0} / {1}" -f (Format-Bytes $readBytes), (Format-Bytes $totalBytes)
+            Write-Progress -Id $ProgressId -Activity $Activity -Status $status -PercentComplete $percent
+
+            if ($AllowCancel -and $cancelStopwatch.ElapsedMilliseconds -ge 500) {
+                $cancelStopwatch.Restart()
+                if (Test-WSLBMUserCancelRequested) {
+                    throw "Archive hash verification cancelled by user."
+                }
+            }
+        }
+
+        $null = $sha256.TransformFinalBlock($emptyBuffer, 0, 0)
+        Write-Progress -Id $ProgressId -Activity $Activity -Status "Completed" -PercentComplete 100
+        return ([System.BitConverter]::ToString($sha256.Hash) -replace "-", "").ToLowerInvariant()
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ($null -ne $sha256) {
+            $sha256.Dispose()
+        }
+        if ($null -ne $cancelStopwatch) {
+            $cancelStopwatch.Stop()
+        }
+        Write-Progress -Id $ProgressId -Activity $Activity -Completed
+    }
+}
+
 function Test-BackupManifestArchiveConsistency {
     <#
     .SYNOPSIS
@@ -902,17 +968,30 @@ function Test-BackupManifestArchiveConsistency {
 
     # ArchiveSha256 check.
     if ($mf.ArchiveSha256) {
-        Write-Host "  [Manifest] Verifying archive hash; large backups may take time..." -ForegroundColor Cyan
+        Write-Host "  [Manifest] Verifying archive hash; large backups may take time. Press Q to cancel." -ForegroundColor Cyan
         try {
-            $hashResult = Get-FileHash -LiteralPath $ArchiveFilePath -Algorithm SHA256 -ErrorAction Stop
-            if ($hashResult.Hash -ne $mf.ArchiveSha256) {
-                $errors += "ArchiveSha256 mismatch: manifest=$($mf.ArchiveSha256), actual=$($hashResult.Hash)"
+            $actualHash = Get-WSLBMFileSha256WithProgress `
+                -LiteralPath $ArchiveFilePath `
+                -Activity "Verifying manifest archive SHA256" `
+                -AllowCancel $true `
+                -ProgressId 4101
+            $expectedHash = ([string]$mf.ArchiveSha256).ToLowerInvariant()
+            if ($actualHash -ne $expectedHash) {
+                $errors += "ArchiveSha256 mismatch: manifest=$($mf.ArchiveSha256), actual=$actualHash"
             }
             else {
                 Write-Host "  [Manifest] SHA256 verified" -ForegroundColor Green
             }
         }
         catch {
+            if ($_.Exception.Message -like "*cancelled by user*") {
+                Write-Host "  [Manifest] SHA256 verification cancelled by user." -ForegroundColor Yellow
+                Write-LogEntry "WARN" "Restore-Manifest" "Archive SHA256 verification cancelled by user. Archive=$ArchiveFilePath" -Distro $Script:CurrentDistro
+            }
+            else {
+                Write-Host "  [Manifest] SHA256 verification failed: $($_.Exception.Message)" -ForegroundColor Red
+                Write-LogEntry "ERROR" "Restore-Manifest" "Archive SHA256 verification failed. Archive=$ArchiveFilePath | Error=$($_.Exception.Message)" -Distro $Script:CurrentDistro
+            }
             $errors += "Cannot compute archive hash: $($_.Exception.Message)"
         }
     }
@@ -948,13 +1027,17 @@ function Get-DisplayedBackupCount {
 }
 
 function Show-BackupTable {
-    param($Backups)
+    param(
+        $Backups,
+
+        [switch]$ShowAll
+    )
 
     Write-Host "----------------------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host("{0,-4} {1,-11} {2,-20} {3,-12} {4,-15} {5,-16} {6}" -f "#", "Status", "Date", "Size", "Type", "Source", "Note") -ForegroundColor Gray
     Write-Host "----------------------------------------------------------------------------------------------" -ForegroundColor DarkGray
 
-    $limit = Get-DisplayedBackupCount -Backups $Backups
+    $limit = if ($ShowAll) { @($Backups).Count } else { Get-DisplayedBackupCount -Backups $Backups }
     for ($i = 0; $i -lt $limit; $i++) {
         $b = $Backups[$i]
 
@@ -1048,6 +1131,10 @@ function Show-BackupTable {
     Write-Host "unavailable" -ForegroundColor DarkGray
     if ($Backups.Count -gt $limit) {
         Write-Host ("  Showing only the most recent {0} of {1} backups. Restore/Delete selection is limited to visible entries." -f $limit, $Backups.Count) -ForegroundColor Yellow
+        Write-Host "  Enter A at the selection prompt to show all recognized backups." -ForegroundColor Yellow
+    }
+    elseif ($ShowAll -and $Backups.Count -gt 20) {
+        Write-Host ("  Showing all {0} recognized backups. Selection remains limited to listed entries." -f $Backups.Count) -ForegroundColor Yellow
     }
 }
 
@@ -1157,7 +1244,7 @@ function Write-LogEntry {
     $ym = (Get-Date).ToString('yyyy-MM')
     $opsLog = Join-Path $Global:LogRoot "ops-$ym.log"
     $errLog = Join-Path $Global:LogRoot "error-$ym.log"
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
     $durationStr = ""
     if (($Level -eq "SUCCESS" -or $Level -eq "ERROR") -and $Global:BackupState.StartTime) {
         $elapsed = New-TimeSpan -Start $Global:BackupState.StartTime -End (Get-Date)
@@ -1176,6 +1263,19 @@ function Write-LogEntry {
             $null = $_
         }
     }
+}
+
+function Write-WSLBMTextFileUtf8NoBom {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LiteralPath,
+
+        [AllowNull()]
+        [string]$Content = ""
+    )
+
+    $encoding = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($LiteralPath, $Content, $encoding)
 }
 
 function New-BackupDirectory {
@@ -1557,6 +1657,16 @@ function Get-WSLBMReadOnlyWslProbeDisplay {
     $errorLine = Get-WSLBMFirstDiagnosticsLine -Value $ProbeResult.Error
     $decodeWarning = [bool]$ProbeResult.DecodeWarning
     $captureException = [bool]$ProbeResult.CaptureException
+    $timedOut = [bool]$ProbeResult.TimedOut
+    $skippedBecauseDryRun = [bool]$ProbeResult.SkippedBecauseDryRun
+
+    if ($skippedBecauseDryRun) {
+        return [PSCustomObject]@{ Status = "WARN"; Detail = "$CommandText skipped because DryRun does not call wsl.exe." }
+    }
+
+    if ($timedOut) {
+        return [PSCustomObject]@{ Status = "FAIL"; Detail = "$CommandText timed out." }
+    }
 
     if ($captureException) {
         $detail = if ([string]::IsNullOrWhiteSpace($errorLine)) { "$CommandText capture failed." } else { $errorLine }
@@ -1665,14 +1775,21 @@ function Test-WSLBMDiagnosticsItem {
 function Invoke-WSLBMReadOnlyWslProbe {
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet("status", "version", "list-verbose")]
-        [string]$Probe
+        [ValidateSet("status", "version", "list-verbose", "list-quiet", "list", "whoami")]
+        [string]$Probe,
+
+        [string]$Distro = $Script:CurrentDistro,
+
+        [int]$TimeoutSeconds = $Script:ReadOnlyWSLProbeTimeoutSeconds
     )
 
     $arguments = @(switch ($Probe) {
         "status"       { @("--status") }
         "version"      { @("--version") }
         "list-verbose" { @("--list", "--verbose") }
+        "list-quiet"   { @("--list", "--quiet") }
+        "list"         { @("--list") }
+        "whoami"       { @("-d", $Distro, "whoami") }
     })
 
     $exitCode = $null
@@ -1680,13 +1797,39 @@ function Invoke-WSLBMReadOnlyWslProbe {
     $errorText = ""
     $decodeWarning = $false
     $captureException = $false
+    $timedOut = $false
     $outputEncodingName = ""
     $errorEncodingName = ""
+
+    if ($Global:DryRun) {
+        $outputText = switch ($Probe) {
+            "list-quiet" { "DRY-RUN-DISTRO" }
+            "list"       { "DRY-RUN-DISTRO" }
+            "whoami"     { "dryrun" }
+            default      { "" }
+        }
+        $errorText = "DRY RUN: read-only WSL probe skipped; real run still requires WSL."
+        Write-LogEntry "WARN" "WSL-Probe-DryRun" "Skipped read-only WSL probe '$Probe'; real run still requires WSL." -Distro $Distro
+
+        return [PSCustomObject]@{
+            Probe                = [string]$Probe
+            Args                 = @($arguments)
+            ExitCode             = 0
+            Output               = $outputText
+            Error                = $errorText
+            DecodeWarning        = $false
+            CaptureException     = $false
+            TimedOut             = $false
+            SkippedBecauseDryRun = $true
+            OutputEncoding       = ""
+            ErrorEncoding        = ""
+        }
+    }
 
     try {
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
         $startInfo.FileName = "wsl.exe"
-        $startInfo.Arguments = ($arguments -join " ")
+        $null = Set-WSLBMProcessStartInfoArguments -StartInfo $startInfo -Arguments $arguments
         $startInfo.UseShellExecute = $false
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
@@ -1701,15 +1844,29 @@ function Invoke-WSLBMReadOnlyWslProbe {
             $null = $process.Start()
             $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdoutBuffer)
             $stderrTask = $process.StandardError.BaseStream.CopyToAsync($stderrBuffer)
-            $process.WaitForExit()
-            $stdoutTask.Wait()
-            $stderrTask.Wait()
-            $exitCode = $process.ExitCode
+            if ($TimeoutSeconds -gt 0) {
+                $exited = $process.WaitForExit($TimeoutSeconds * 1000)
+                if (-not $exited) {
+                    $timedOut = $true
+                    Stop-WSLBMProcessTree -Process $process -OperationName "WSL-Probe"
+                }
+            }
+            else {
+                $process.WaitForExit()
+            }
+
+            $null = $process.WaitForExit(5000)
+            $null = $stdoutTask.Wait(5000)
+            $null = $stderrTask.Wait(5000)
+            $exitCode = if ($process.HasExited) { $process.ExitCode } else { $null }
 
             $stdoutDecoded = ConvertFrom-WSLBMProbeBytes -Bytes $stdoutBuffer.ToArray()
             $stderrDecoded = ConvertFrom-WSLBMProbeBytes -Bytes $stderrBuffer.ToArray()
             $outputText = $stdoutDecoded.Text
             $errorText = $stderrDecoded.Text
+            if ($timedOut -and [string]::IsNullOrWhiteSpace($errorText)) {
+                $errorText = "Timed out after $TimeoutSeconds seconds."
+            }
             $decodeWarning = [bool]($stdoutDecoded.DecodeWarning -or $stderrDecoded.DecodeWarning)
             $outputEncodingName = $stdoutDecoded.EncodingName
             $errorEncodingName = $stderrDecoded.EncodingName
@@ -1733,6 +1890,8 @@ function Invoke-WSLBMReadOnlyWslProbe {
     $properties["Error"] = $errorText
     $properties["DecodeWarning"] = $decodeWarning
     $properties["CaptureException"] = $captureException
+    $properties["TimedOut"] = $timedOut
+    $properties["SkippedBecauseDryRun"] = $false
     $properties["OutputEncoding"] = $outputEncodingName
     $properties["ErrorEncoding"] = $errorEncodingName
 
@@ -2110,7 +2269,6 @@ function Test-7zInstalled {
     if ($foundPath) {
         $Global:Config.SevenZipPath = $foundPath
         Save-Config
-        $env:PATH += ";$(Split-Path $foundPath -Parent)"
         Write-Host "Found 7-Zip: " -NoNewline
         Write-Host $foundPath -ForegroundColor Green
         return $true
@@ -2126,22 +2284,21 @@ function Test-7zInstalled {
     if (Test-Path -LiteralPath $userPath -PathType Leaf) {
         $Global:Config.SevenZipPath = $userPath
         Save-Config
-        $env:PATH += ";$(Split-Path $userPath -Parent)"
         return $true
     }
     return $false
 }
 
 function Test-WSLAvailability {
-    try {
-        $output = @(& wsl.exe --status 2>&1)
-        $exitCode = $LASTEXITCODE
+    if ($Global:DryRun) {
+        Write-Host "[WARN] DryRun: WSL availability check skipped; real runs still require WSL." -ForegroundColor Yellow
+        Write-LogEntry "WARN" "WSL-Availability" "DryRun skipped WSL availability check; real runs still require WSL."
+        return
     }
-    catch {
-        Write-Host "[CRITICAL] WSL Not Detected!" -ForegroundColor Red
-        Write-Host "  $($_.Exception.Message)" -ForegroundColor Yellow
-        exit 1
-    }
+
+    $probe = Invoke-WSLBMReadOnlyWslProbe -Probe "status" -TimeoutSeconds $Script:ReadOnlyWSLProbeTimeoutSeconds
+    $output = @($probe.Output, $probe.Error)
+    $exitCode = $probe.ExitCode
 
     if ($null -eq $exitCode -or $exitCode -ne 0) {
         $exitText = if ($null -eq $exitCode) { "unknown exit code" } else { "exit code $exitCode" }
@@ -2164,13 +2321,12 @@ function Get-WSLUser {
         throw "Cannot resolve WSL user: current distro name is unsafe."
     }
 
-    try {
-        $output = @(& wsl.exe -d $Script:CurrentDistro whoami 2>&1)
-        $exitCode = $LASTEXITCODE
+    $probe = Invoke-WSLBMReadOnlyWslProbe -Probe "whoami" -Distro $Script:CurrentDistro -TimeoutSeconds $Script:ReadOnlyWSLProbeTimeoutSeconds
+    $output = @(([string]$probe.Output) -split "\r?\n")
+    if (-not $probe.SkippedBecauseDryRun) {
+        $output += @(([string]$probe.Error) -split "\r?\n")
     }
-    catch {
-        throw "Cannot resolve WSL user for '$Script:CurrentDistro': $($_.Exception.Message)"
-    }
+    $exitCode = $probe.ExitCode
 
     $lines = @()
     foreach ($item in $output) {
@@ -2201,7 +2357,7 @@ function Get-WSLUser {
         throw "Cannot resolve WSL user for '$Script:CurrentDistro': whoami returned error-like output."
     }
 
-    if ($userName -notmatch '^[a-z_][a-z0-9_-]*[$]?$') {
+    if ($userName -notmatch '^[A-Za-z_][A-Za-z0-9_-]*[$]?$') {
         throw "Cannot resolve WSL user for '$Script:CurrentDistro': whoami returned an unexpected username '$userName'."
     }
 
@@ -2209,11 +2365,15 @@ function Get-WSLUser {
 }
 
 function Format-QuotedArgs {
+    # Legacy display/fallback helper only. Prefer native process ArgumentList paths
+    # for new code; use this only when a legacy preview/fallback cannot accept arrays.
+    # This is not a general shell escaping guarantee and must not be used as the
+    # default path for real process execution.
     param([string[]]$Arguments)
     $safeArgs = @()
     foreach ($arg in $Arguments) {
-        if ($arg -match " ") {
-            $safeArgs += "`"$arg`""
+        if ($null -eq $arg -or $arg.Length -eq 0 -or $arg -match '[\s`"$%&<>|^]') {
+            $safeArgs += (ConvertTo-WSLBMNativeArgumentString -Arguments @($arg))
         }
         else {
             $safeArgs += $arg
@@ -2222,8 +2382,349 @@ function Format-QuotedArgs {
     return $safeArgs -join " "
 }
 
+function ConvertTo-WSLBMNativeArgumentString {
+    # Fallback only: used when ProcessStartInfo.ArgumentList is unavailable.
+    param(
+        [AllowNull()]
+        [string[]]$Arguments = @()
+    )
+
+    $quoted = @()
+    foreach ($argument in $Arguments) {
+        $arg = if ($null -eq $argument) { "" } else { [string]$argument }
+        if ($arg.Length -eq 0) {
+            $quoted += '""'
+            continue
+        }
+
+        if ($arg -notmatch '[\s`"$%&<>|^]') {
+            $quoted += $arg
+            continue
+        }
+
+        $builder = New-Object System.Text.StringBuilder
+        [void]$builder.Append('"')
+        $backslashes = 0
+        foreach ($ch in $arg.ToCharArray()) {
+            if ($ch -eq '\') {
+                $backslashes++
+                continue
+            }
+
+            if ($ch -eq '"') {
+                [void]$builder.Append(('\' * (($backslashes * 2) + 1)))
+                [void]$builder.Append('"')
+                $backslashes = 0
+                continue
+            }
+
+            if ($backslashes -gt 0) {
+                [void]$builder.Append(('\' * $backslashes))
+                $backslashes = 0
+            }
+            [void]$builder.Append($ch)
+        }
+
+        if ($backslashes -gt 0) {
+            [void]$builder.Append(('\' * ($backslashes * 2)))
+        }
+        [void]$builder.Append('"')
+        $quoted += $builder.ToString()
+    }
+
+    return ($quoted -join " ")
+}
+
+function Set-WSLBMProcessStartInfoArguments {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.ProcessStartInfo]$StartInfo,
+
+        [AllowNull()]
+        [string[]]$Arguments = @()
+    )
+
+    $argumentListProperty = $StartInfo.GetType().GetProperty("ArgumentList")
+    if ($null -ne $argumentListProperty -and $null -ne $StartInfo.ArgumentList) {
+        foreach ($argument in $Arguments) {
+            $arg = if ($null -eq $argument) { "" } else { [string]$argument }
+            $StartInfo.ArgumentList.Add($arg)
+        }
+        return "ArgumentList"
+    }
+
+    $StartInfo.Arguments = ConvertTo-WSLBMNativeArgumentString -Arguments $Arguments
+    return "ArgumentsFallback"
+}
+
+function Get-WSLBMProcessTreeIds {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$RootProcessId
+    )
+
+    $orderedIds = New-Object System.Collections.Generic.List[int]
+    $pending = New-Object System.Collections.Generic.Queue[int]
+    $pending.Enqueue($RootProcessId)
+
+    while ($pending.Count -gt 0) {
+        $currentProcessId = $pending.Dequeue()
+        if ($orderedIds.Contains($currentProcessId)) {
+            continue
+        }
+
+        $orderedIds.Add($currentProcessId)
+        try {
+            $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$currentProcessId" -ErrorAction Stop)
+        }
+        catch {
+            $children = @()
+        }
+
+        foreach ($child in $children) {
+            if ($null -ne $child.ProcessId) {
+                $pending.Enqueue([int]$child.ProcessId)
+            }
+        }
+    }
+
+    return @($orderedIds.ToArray())
+}
+
+function Stop-WSLBMProcessTree {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.Process]$Process,
+
+        [string]$OperationName = "NativeProcess"
+    )
+
+    if ($null -eq $Process) {
+        return
+    }
+
+    try {
+        if ($Process.HasExited) {
+            return
+        }
+
+        $pidToKill = $Process.Id
+        try {
+            $taskKill = Start-Process "taskkill" `
+                -ArgumentList "/F", "/T", "/PID", $pidToKill `
+                -NoNewWindow -Wait -PassThru -ErrorAction Stop
+            $null = $taskKill
+            $null = $Process.WaitForExit(5000)
+        }
+        catch {
+            try {
+                # Fallback mirrors taskkill /T by stopping child PIDs before the root PID.
+                $fallbackProcessIds = @(Get-WSLBMProcessTreeIds -RootProcessId $pidToKill)
+                [array]::Reverse($fallbackProcessIds)
+                foreach ($fallbackProcessId in $fallbackProcessIds) {
+                    Stop-Process -Id $fallbackProcessId -Force -ErrorAction SilentlyContinue
+                }
+                $null = $Process.WaitForExit(5000)
+            }
+            catch {
+                $null = $_
+            }
+        }
+    }
+    catch {
+        Write-LogEntry "WARN" $OperationName "Failed to stop process tree: $($_.Exception.Message)"
+    }
+}
+
+function Test-WSLBMUserCancelRequested {
+    try {
+        if ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            return ($key.Key -eq "Q")
+        }
+    }
+    catch {
+        return $false
+    }
+
+    return $false
+}
+
+function Invoke-WSLBMNativeProcessChecked {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [AllowNull()]
+        [string[]]$Arguments = @(),
+
+        [string]$OperationName = "NativeProcess",
+
+        [string]$Description = "",
+
+        [int]$TimeoutSeconds = 0,
+
+        [switch]$AllowCancel,
+
+        [switch]$RegisterActiveProcess,
+
+        [string]$WorkingDirectory = "",
+
+        [string]$Distro = $Script:CurrentDistro
+    )
+
+    $argumentString = ConvertTo-WSLBMNativeArgumentString -Arguments $Arguments
+    $commandPreview = if ([string]::IsNullOrWhiteSpace($argumentString)) { $FilePath } else { "$FilePath $argumentString" }
+    $argumentMode = "Unknown"
+    $process = $null
+    $stdOutTask = $null
+    $stdErrTask = $null
+    $processId = $null
+    $timedOut = $false
+    $cancelled = $false
+    $errorMessage = ""
+    $startedAt = Get-Date
+
+    $previousActiveProcess = $Global:BackupState.ActiveProcess
+    try {
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $FilePath
+        $argumentMode = Set-WSLBMProcessStartInfoArguments -StartInfo $startInfo -Arguments $Arguments
+        if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+            $startInfo.WorkingDirectory = $WorkingDirectory
+        }
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.CreateNoWindow = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+
+        Write-LogEntry "INFO" $OperationName "$Description | ArgumentMode=$argumentMode | $commandPreview" -Distro $Distro
+        if (-not $process.Start()) {
+            throw "Process did not start."
+        }
+
+        $processId = $process.Id
+        if ($RegisterActiveProcess) {
+            $Global:BackupState.ActiveProcess = $process
+        }
+
+        $stdOutTask = $process.StandardOutput.ReadToEndAsync()
+        $stdErrTask = $process.StandardError.ReadToEndAsync()
+
+        while (-not $process.HasExited) {
+            if ($TimeoutSeconds -gt 0) {
+                $elapsedSeconds = ((Get-Date) - $startedAt).TotalSeconds
+                if ($elapsedSeconds -ge $TimeoutSeconds) {
+                    $timedOut = $true
+                    $errorMessage = "Timed out after $TimeoutSeconds seconds."
+                    Write-Host "[ERROR] $Description timed out after $TimeoutSeconds seconds." -ForegroundColor Red
+                    Write-LogEntry "ERROR" $OperationName "$Description timed out after $TimeoutSeconds seconds. PID=$processId" -Distro $Distro
+                    Stop-WSLBMProcessTree -Process $process -OperationName $OperationName
+                    break
+                }
+            }
+
+            if ($AllowCancel -and (Test-WSLBMUserCancelRequested)) {
+                $cancelled = $true
+                $errorMessage = "Cancelled by user."
+                Write-Host "`n[Abort] User requested cancel..." -ForegroundColor Yellow
+                Write-LogEntry "WARN" $OperationName "$Description cancelled by user. PID=$processId" -Distro $Distro
+                Stop-WSLBMProcessTree -Process $process -OperationName $OperationName
+                break
+            }
+
+            Start-Sleep -Milliseconds 200
+        }
+
+        $null = $process.WaitForExit(5000)
+        if ($null -ne $stdOutTask) {
+            $null = $stdOutTask.Wait(5000)
+        }
+        if ($null -ne $stdErrTask) {
+            $null = $stdErrTask.Wait(5000)
+        }
+
+        $stdOut = if ($null -ne $stdOutTask -and $stdOutTask.IsCompleted) { [string]$stdOutTask.Result } else { "" }
+        $stdErr = if ($null -ne $stdErrTask -and $stdErrTask.IsCompleted) { [string]$stdErrTask.Result } else { "" }
+        $combined = (($stdOut, $stdErr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine
+        $exitCode = if ($process.HasExited) { $process.ExitCode } else { $null }
+
+        if ($timedOut -or $cancelled) {
+            return [pscustomobject]@{
+                Success              = $false
+                ExitCode             = $exitCode
+                TimedOut             = $timedOut
+                Cancelled            = $cancelled
+                StdOut               = $stdOut
+                StdErr               = $stdErr
+                Output               = $combined
+                CombinedOutput       = $combined
+                ErrorMessage         = $errorMessage
+                ProcessId            = $processId
+                ArgumentMode         = $argumentMode
+                SkippedBecauseDryRun = $false
+                Description          = $Description
+            }
+        }
+
+        if ($null -eq $exitCode) {
+            $errorMessage = "Process did not report an exit code."
+        }
+        elseif ($exitCode -ne 0) {
+            $errorMessage = "Process exited with code $exitCode."
+        }
+
+        return [pscustomobject]@{
+            Success              = ($null -ne $exitCode -and $exitCode -eq 0)
+            ExitCode             = $exitCode
+            TimedOut             = $false
+            Cancelled            = $false
+            StdOut               = $stdOut
+            StdErr               = $stdErr
+            Output               = $combined
+            CombinedOutput       = $combined
+            ErrorMessage         = $errorMessage
+            ProcessId            = $processId
+            ArgumentMode         = $argumentMode
+            SkippedBecauseDryRun = $false
+            Description          = $Description
+        }
+    }
+    catch {
+        $errorMessage = $_.Exception.Message
+        Write-LogEntry "ERROR" $OperationName "$Description failed to start or monitor: $errorMessage" -Distro $Distro
+        return [pscustomobject]@{
+            Success              = $false
+            ExitCode             = $null
+            TimedOut             = $timedOut
+            Cancelled            = $cancelled
+            StdOut               = ""
+            StdErr               = ""
+            Output               = ""
+            CombinedOutput       = ""
+            ErrorMessage         = $errorMessage
+            ProcessId            = $processId
+            ArgumentMode         = $argumentMode
+            SkippedBecauseDryRun = $false
+            Description          = $Description
+        }
+    }
+    finally {
+        if ($RegisterActiveProcess) {
+            $Global:BackupState.ActiveProcess = $previousActiveProcess
+        }
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+    }
+}
+
 function Close-VSCodeSafely {
-    if (Get-Process | Where-Object ProcessName -like "*code*") {
+    $ideProcessNames = @("Code", "Code - Insiders", "VSCodium", "Cursor", "Windsurf")
+    if (Get-Process -Name $ideProcessNames -ErrorAction SilentlyContinue) {
         Write-Host "[WARN] VS Code is running. It might lock WSL files." -ForegroundColor Yellow
         $ans = Read-Host "Press [Enter] to continue anyway, or [Q] to cancel"
         if ($ans -eq "Q" -or $ans -eq "q") { return $false }
@@ -2231,29 +2732,187 @@ function Close-VSCodeSafely {
     return $true
 }
 
-function Test-DiskSpace {
-    param($gb)
-    $path = if (Get-InstanceBackupPath) { Get-InstanceBackupPath } else { $Global:Config.GlobalBackupRoot }
+function Get-WSLBMUncShareRoot {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+
+    if ($Path -match '^(\\\\[^\\]+\\[^\\]+)') {
+        return $Matches[1]
+    }
+
+    return ""
+}
+
+function Resolve-WSLBMSpaceCheckPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($Path)
+    if ([string]::IsNullOrWhiteSpace($expanded)) {
+        throw "Path is empty."
+    }
+
+    if (Test-Path -LiteralPath $expanded -ErrorAction SilentlyContinue) {
+        return [System.IO.Path]::GetFullPath($expanded)
+    }
+
+    $candidate = $expanded
+    while (-not [string]::IsNullOrWhiteSpace($candidate)) {
+        $parent = Split-Path -Path $candidate -Parent -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $candidate) {
+            break
+        }
+
+        if (Test-Path -LiteralPath $parent -ErrorAction SilentlyContinue) {
+            return [System.IO.Path]::GetFullPath($parent)
+        }
+
+        $candidate = $parent
+    }
+
+    $root = [System.IO.Path]::GetPathRoot($expanded)
+    if (-not [string]::IsNullOrWhiteSpace($root)) {
+        if ($root -match '^\\\\') {
+            $shareRoot = Get-WSLBMUncShareRoot -Path $expanded
+            if (-not [string]::IsNullOrWhiteSpace($shareRoot)) {
+                return $shareRoot
+            }
+        }
+        return $root
+    }
+
+    throw "Cannot determine a space check path for '$Path'."
+}
+
+function Get-WSLBMPathFreeSpaceInfo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [string]$Label = "Path",
+
+        [string]$LogAction = "Space",
+
+        [string]$Distro = $Script:CurrentDistro
+    )
+
+    $tempDriveName = $null
     try {
-        $qualifier = Split-Path -Path $path -Qualifier
-        if ([string]::IsNullOrWhiteSpace($qualifier)) {
-            throw "Cannot determine drive qualifier for backup path: $path"
+        $checkPath = Resolve-WSLBMSpaceCheckPath -Path $Path
+        $fullPath = [System.IO.Path]::GetFullPath($checkPath)
+        $root = [System.IO.Path]::GetPathRoot($fullPath)
+        $availableBytes = $null
+        $sourceKey = ""
+        $sourceType = ""
+
+        if (-not [string]::IsNullOrWhiteSpace($root) -and $root -match '^[A-Za-z]:\\') {
+            $driveInfo = New-Object -TypeName System.IO.DriveInfo -ArgumentList $root
+            if (-not $driveInfo.IsReady) {
+                throw "Drive '$root' is not ready."
+            }
+            $availableBytes = [long]$driveInfo.AvailableFreeSpace
+            $sourceKey = $driveInfo.Name
+            $sourceType = if ($driveInfo.DriveType -eq [System.IO.DriveType]::Network) { "MappedDrive" } else { "LocalDrive" }
         }
 
-        $drive = $qualifier.TrimEnd(":")
-        if ([string]::IsNullOrWhiteSpace($drive)) {
-            throw "Cannot determine drive name for backup path: $path"
+        if ($null -eq $availableBytes) {
+            $matchedDrive = $null
+            foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction Stop)) {
+                if ($null -eq $drive.Free -or [string]::IsNullOrWhiteSpace($drive.Root)) {
+                    continue
+                }
+
+                if ($fullPath.StartsWith($drive.Root, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    if ($null -eq $matchedDrive -or $drive.Root.Length -gt $matchedDrive.Root.Length) {
+                        $matchedDrive = $drive
+                    }
+                }
+            }
+
+            if ($null -ne $matchedDrive) {
+                $availableBytes = [long]$matchedDrive.Free
+                $sourceKey = $matchedDrive.Root
+                $sourceType = if ($matchedDrive.Root -match '^\\\\') { "MappedUNCPSDrive" } else { "FileSystemPSDrive" }
+            }
         }
 
-        $free = (Get-PSDrive $drive -ErrorAction Stop).Free / 1GB
-        if ($free -lt $gb) {
-            Write-Host "Low Disk Space on ${drive}:! Need $gb GB, only $('{0:N1}' -f $free) GB free." -ForegroundColor Red
-            return $false
+        if ($null -eq $availableBytes -and $fullPath -match '^\\\\') {
+            $shareRoot = Get-WSLBMUncShareRoot -Path $fullPath
+            if ([string]::IsNullOrWhiteSpace($shareRoot)) {
+                throw "Cannot parse UNC share root for $fullPath"
+            }
+
+            $tempDriveName = "WSLBM" + (Get-Random -Minimum 100000 -Maximum 999999)
+            $null = New-PSDrive -Name $tempDriveName -PSProvider FileSystem -Root $shareRoot -ErrorAction Stop
+            $tempDrive = Get-PSDrive -Name $tempDriveName -ErrorAction Stop
+            if ($null -eq $tempDrive.Free) {
+                throw "Temporary UNC PSDrive did not report free space."
+            }
+
+            $availableBytes = [long]$tempDrive.Free
+            $sourceKey = $shareRoot
+            $sourceType = "TemporaryUNCPSDrive"
+        }
+
+        if ($null -eq $availableBytes) {
+            throw "Cannot determine available free space for ${Label}: $Path"
+        }
+
+        Write-LogEntry "INFO" $LogAction "Space source=$sourceType | Label=$Label | Target=$Path | CheckPath=$checkPath | Source=$sourceKey | Available=$(Format-Bytes $availableBytes)" -Distro $Distro
+        return [pscustomobject]@{
+            Success        = $true
+            TargetPath     = $Path
+            CheckPath      = $checkPath
+            FullPath       = $fullPath
+            AvailableBytes = $availableBytes
+            SourceKey      = $sourceKey
+            SourceType     = $sourceType
+            Reason         = ""
         }
     }
     catch {
-        Write-Host "[WARN] Cannot check disk space: $($_.Exception.Message)" -ForegroundColor Yellow
+        $message = $_.Exception.Message
+        Write-LogEntry "ERROR" $LogAction "Unable to determine free space. Label=$Label | Target=$Path | Reason=$message" -Distro $Distro
+        return [pscustomobject]@{
+            Success        = $false
+            TargetPath     = $Path
+            CheckPath      = $null
+            FullPath       = $Path
+            AvailableBytes = $null
+            SourceKey      = ""
+            SourceType     = "Unknown"
+            Reason         = $message
+        }
     }
+    finally {
+        if (-not [string]::IsNullOrWhiteSpace($tempDriveName)) {
+            Remove-PSDrive -Name $tempDriveName -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Test-DiskSpace {
+    param($gb)
+    $path = if (Get-InstanceBackupPath) { Get-InstanceBackupPath } else { $Global:Config.GlobalBackupRoot }
+    $requiredBytes = [long]([double]$gb * 1GB)
+    $space = Get-WSLBMPathFreeSpaceInfo -Path $path -Label "Backup destination" -LogAction "Backup-Space" -Distro $Script:CurrentDistro
+    if (-not $space.Success) {
+        Write-Host "[ERROR] Cannot verify disk space for backup destination: $($space.Reason)" -ForegroundColor Red
+        return $false
+    }
+
+    if ($space.AvailableBytes -lt $requiredBytes) {
+        Write-Host "Low Disk Space on $($space.SourceKey)! Need $gb GB, only $(Format-Bytes $space.AvailableBytes) free." -ForegroundColor Red
+        Write-LogEntry "ERROR" "Backup-Space" "Insufficient space. Required=$(Format-Bytes $requiredBytes) | Available=$(Format-Bytes $space.AvailableBytes) | Path=$path | Source=$($space.SourceType)" -Distro $Script:CurrentDistro
+        return $false
+    }
+
+    Write-LogEntry "INFO" "Backup-Space" "Disk space check passed. Required=$(Format-Bytes $requiredBytes) | Available=$(Format-Bytes $space.AvailableBytes) | Path=$path | Source=$($space.SourceType)" -Distro $Script:CurrentDistro
     return $true
 }
 
@@ -2283,10 +2942,17 @@ Distro: $Script:CurrentDistro
 }
 
 function Remove-LockFile {
-    if ($Global:BackupState.LockFile -and (Test-Path $Global:BackupState.LockFile)) {
-        Remove-Item $Global:BackupState.LockFile -Force -ErrorAction SilentlyContinue
+    try {
+        if ($Global:BackupState.LockFile -and (Test-Path -LiteralPath $Global:BackupState.LockFile)) {
+            Remove-Item -LiteralPath $Global:BackupState.LockFile -Force -ErrorAction Stop
+        }
     }
-    $Global:BackupState.LockFile = $null
+    catch {
+        Write-LogEntry "WARN" "Lock-Remove" "Failed to remove lock file '$($Global:BackupState.LockFile)': $($_.Exception.Message)"
+    }
+    finally {
+        $Global:BackupState.LockFile = $null
+    }
 }
 
 function Stop-ActiveBackupProcesses {
@@ -2294,7 +2960,7 @@ function Stop-ActiveBackupProcesses {
     .SYNOPSIS
         Stop the active backup process tree.
     .DESCRIPTION
-        Uses taskkill with retries, then falls back to Stop-Process.
+        Uses taskkill with retries, then falls back to recursive Stop-Process.
     #>
     if ($null -eq $Global:BackupState.ActiveProcess) {
         return
@@ -2325,9 +2991,13 @@ function Stop-ActiveBackupProcesses {
             }
         }
         catch {
-            # Fallback to Stop-Process when taskkill fails.
+            # Fallback mirrors taskkill /T by stopping child PIDs before the root PID.
             try {
-                Stop-Process -Id $pidToKill -Force -ErrorAction SilentlyContinue
+                $fallbackProcessIds = @(Get-WSLBMProcessTreeIds -RootProcessId $pidToKill)
+                [array]::Reverse($fallbackProcessIds)
+                foreach ($fallbackProcessId in $fallbackProcessIds) {
+                    Stop-Process -Id $fallbackProcessId -Force -ErrorAction SilentlyContinue
+                }
                 Start-Sleep -Milliseconds 500
                 if ($Global:BackupState.ActiveProcess.HasExited) {
                     Write-Host " Done (fallback)." -ForegroundColor DarkGray
@@ -2510,8 +3180,12 @@ function Select-WSLDistro {
     if ($Force) { $Script:CurrentDistro = $null }
 
     try {
-        $raw = @(& wsl.exe --list --quiet 2>&1)
-        $quietExitCode = $LASTEXITCODE
+        $quietProbe = Invoke-WSLBMReadOnlyWslProbe -Probe "list-quiet" -TimeoutSeconds $Script:ReadOnlyWSLProbeTimeoutSeconds
+        $raw = @(([string]$quietProbe.Output) -split "\r?\n")
+        if (-not $quietProbe.SkippedBecauseDryRun) {
+            $raw += @(([string]$quietProbe.Error) -split "\r?\n")
+        }
+        $quietExitCode = $quietProbe.ExitCode
         if ($null -eq $quietExitCode -or $quietExitCode -ne 0) {
             $exitText = if ($null -eq $quietExitCode) { "unknown exit code" } else { "exit code $quietExitCode" }
             $detail = ($raw | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 3) -join " | "
@@ -2523,8 +3197,12 @@ function Select-WSLDistro {
         }
 
         if (-not $raw) {
-            $rawList = @(& wsl.exe --list 2>&1)
-            $listExitCode = $LASTEXITCODE
+            $listProbe = Invoke-WSLBMReadOnlyWslProbe -Probe "list" -TimeoutSeconds $Script:ReadOnlyWSLProbeTimeoutSeconds
+            $rawList = @(([string]$listProbe.Output) -split "\r?\n")
+            if (-not $listProbe.SkippedBecauseDryRun) {
+                $rawList += @(([string]$listProbe.Error) -split "\r?\n")
+            }
+            $listExitCode = $listProbe.ExitCode
             if ($null -eq $listExitCode -or $listExitCode -ne 0) {
                 $exitText = if ($null -eq $listExitCode) { "unknown exit code" } else { "exit code $listExitCode" }
                 $detail = ($rawList | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 3) -join " | "
@@ -2624,6 +3302,14 @@ function Set-InstanceBackupPath {
     Save-Config
 }
 
+function Clear-InstanceBackupPath {
+    if ($Global:Config.Instances.ContainsKey($Script:CurrentDistro)) {
+        $Global:Config.Instances[$Script:CurrentDistro].BackupPath = $null
+        Save-Config
+        Write-LogEntry "INFO" "Config" "Cleared saved backup destination for distro '$Script:CurrentDistro'." -Distro $Script:CurrentDistro
+    }
+}
+
 function Get-BackupDestination {
     param(
         [string]$defaultName,
@@ -2667,6 +3353,65 @@ function Get-BackupDestination {
         switch ($sel) {
             "1" { $finalPath = $globalPath }
             "2" { $finalPath = "CUSTOM" }
+        }
+    }
+
+    $usingSavedInstanceDefault = ($savedPath -and $sel -eq "1")
+    if ($usingSavedInstanceDefault -and $finalPath -ne "CUSTOM" -and -not (Test-Path -LiteralPath $finalPath -ErrorAction SilentlyContinue)) {
+        $savedValidation = Assert-WSLBMBackupRootPath -Path $finalPath -Label "Saved instance default destination"
+        Write-WSLBMPathValidationResult -Result $savedValidation -Label "Saved instance default destination"
+        if (-not $savedValidation.IsValid) {
+            Write-Host "[CONFIG ERROR] Saved instance default destination is blocked. Choose a new path or clear the saved default in Settings." -ForegroundColor Red
+            return $null
+        }
+
+        Write-Host "[WARN] Saved instance default path does not exist: $finalPath" -ForegroundColor Yellow
+        Write-LogEntry "WARN" "Config" "Saved instance backup destination does not exist: $finalPath" -Distro $Script:CurrentDistro
+
+        if ($PreviewOnly) {
+            Write-Host "  DRY RUN: would offer to create this directory, choose a new path, clear the saved default, or cancel." -ForegroundColor Yellow
+            Write-Host "  DRY RUN: would clear only this distro's saved default if selected and confirmed." -ForegroundColor Yellow
+            Write-Host "  DRY RUN: would not create directory or write config." -ForegroundColor Yellow
+        }
+        else {
+            while ($true) {
+                Write-Host "  [C] Create this directory and continue"
+                Write-Host "  [N] Choose a new path"
+                Write-Host "  [R] Clear this saved default"
+                Write-Host "  [Q] Cancel"
+                $missingChoice = Read-Host "Saved default action"
+
+                if ($missingChoice -in @("q", "Q")) {
+                    return $null
+                }
+                if ($missingChoice -in @("n", "N")) {
+                    $finalPath = "CUSTOM"
+                    break
+                }
+                if ($missingChoice -in @("r", "R")) {
+                    $clearConfirm = Read-Host "Clear saved default for '$Script:CurrentDistro'? Type CLEAR to confirm"
+                    if ($clearConfirm -ceq "CLEAR") {
+                        Clear-InstanceBackupPath
+                        Write-Host "Saved instance default cleared. Choose a destination again." -ForegroundColor Green
+                        return (Get-BackupDestination -defaultName $defaultName)
+                    }
+                    Write-Host "Saved default was not cleared." -ForegroundColor Yellow
+                    continue
+                }
+                if ($missingChoice -in @("c", "C")) {
+                    $createAns = Read-Host "Create saved default directory now? [Y/N/Q]"
+                    if ($createAns -eq "Y" -or $createAns -eq "y") {
+                        if (-not (New-BackupDirectory $finalPath)) { return $null }
+                        break
+                    }
+                    if ($createAns -in @("q", "Q")) {
+                        return $null
+                    }
+                    continue
+                }
+
+                Write-Host "Invalid option." -ForegroundColor Red
+            }
         }
     }
 
@@ -2769,21 +3514,36 @@ function Test-BackupIntegrity {
     $sevenZipExe = Resolve-WSLBMSevenZipPath
 
     $argList = @("t", $backupFile, "-y")
-    $argsStr = Format-QuotedArgs $argList
+    $checkResult = Invoke-WSLBMNativeProcessChecked `
+        -FilePath $sevenZipExe `
+        -Arguments $argList `
+        -OperationName "Backup-Integrity" `
+        -Description "7z integrity check" `
+        -TimeoutSeconds $Script:SevenZipIntegrityTimeoutSeconds `
+        -Distro $Script:CurrentDistro
+    $exitCode = $checkResult.ExitCode
 
-    $proc = Start-Process $sevenZipExe -ArgumentList $argsStr -NoNewWindow -PassThru -Wait
-    $exitCode = $proc.ExitCode
+    if ($checkResult.TimedOut) {
+        throw "7z integrity check failed: timed out after $Script:SevenZipIntegrityTimeoutSeconds seconds."
+    }
+    if ($checkResult.Cancelled) {
+        throw "7z integrity check failed: cancelled by user."
+    }
     if ($null -eq $exitCode) {
         throw "7z integrity check failed: process did not report an exit code."
     }
     if ($exitCode -ne 0) {
-        throw "CRC Integrity Check Failed (7z exit code $exitCode)"
+        $detail = Get-WSLBMFirstDiagnosticsLine -Value $checkResult.CombinedOutput
+        if ([string]::IsNullOrWhiteSpace($detail)) {
+            throw "CRC Integrity Check Failed (7z exit code $exitCode)"
+        }
+        throw "CRC Integrity Check Failed (7z exit code $exitCode): $detail"
     }
     Write-Host "  [OK] Integrity Check" -ForegroundColor Green
 }
 
 function Get-WSLBMScriptVersion {
-    return "v4.01"
+    return $Script:WSLBMScriptVersion
 }
 
 function Assert-WSLBMManifestPath {
@@ -2891,7 +3651,7 @@ function Write-BackupManifest {
             $manifest.OperationId = $Script:CurrentOperationId
         }
 
-        $manifest | ConvertTo-Json -Depth 4 | Out-File -LiteralPath $manifestPath -Encoding UTF8
+        Write-WSLBMTextFileUtf8NoBom -LiteralPath $manifestPath -Content ($manifest | ConvertTo-Json -Depth 4)
         Write-Host "  [OK] Manifest written: manifest.json" -ForegroundColor Green
         Write-LogEntry "INFO" "Backup-Manifest" "Manifest written: $manifestPath" -Distro $SourceDistro
         return $manifestPath
@@ -2966,13 +3726,105 @@ function Test-SafetyNetArchive {
 
     Write-Host "  -> Safety Net Check: Verifying exported tar readability..." -ForegroundColor Cyan
     try {
-        Test-BackupIntegrity -backupFile $safetyFile -backupType "SAFETY-NET" -MinimumSizeBytes 1KB
+        $safetyItem = Get-Item -LiteralPath $safetyFile -ErrorAction Stop
+        if ($safetyItem.Length -lt $Script:MinimumSafetyNetArchiveBytes) {
+            Write-LogEntry "ERROR" "Restore-SafetyNet" "Safety Net archive below minimum threshold. Path=$safetyFile | Actual=$($safetyItem.Length) | Minimum=$Script:MinimumSafetyNetArchiveBytes" -Distro $Script:CurrentDistro
+            throw "Safety Net archive is too small. Actual=$(Format-Bytes $safetyItem.Length), minimum=$(Format-Bytes $Script:MinimumSafetyNetArchiveBytes). Path=$safetyFile"
+        }
+
+        Test-BackupIntegrity -backupFile $safetyFile -backupType "SAFETY-NET" -MinimumSizeBytes $Script:MinimumSafetyNetArchiveBytes
         return $true
     }
     catch {
         Write-Host "  [FAILED] Safety Net validation failed: $($_.Exception.Message)" -ForegroundColor Red
         return $false
     }
+}
+
+function Test-RestoreSafetyNetExportSpace {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DistroName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SafetyNetPath
+    )
+
+    $estimatedBytes = $null
+    $estimateSource = ""
+    $registryInfo = Get-WSLDistroRegistryInfo -DistroName $DistroName
+    if ($registryInfo.Success) {
+        $vhdxPath = Join-Path $registryInfo.BasePath "ext4.vhdx"
+        try {
+            if (Test-Path -LiteralPath $vhdxPath -PathType Leaf) {
+                $vhdxItem = Get-Item -LiteralPath $vhdxPath -ErrorAction Stop
+                $estimatedBytes = [long]$vhdxItem.Length
+                $estimateSource = "ext4.vhdx"
+            }
+            else {
+                Write-Host "[WARN] Cannot find ext4.vhdx for precise Safety Net size estimate: $vhdxPath" -ForegroundColor Yellow
+                Write-LogEntry "WARN" "Restore-SafetyNet-Space" "ext4.vhdx not found for precise estimate. Distro=$DistroName | Path=$vhdxPath" -Distro $DistroName
+            }
+        }
+        catch {
+            Write-Host "[WARN] Cannot read ext4.vhdx size for precise Safety Net estimate: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-LogEntry "WARN" "Restore-SafetyNet-Space" "Cannot read ext4.vhdx size for estimate: $($_.Exception.Message)" -Distro $DistroName
+        }
+    }
+    else {
+        Write-Host "[WARN] Cannot read WSL registry BasePath for precise Safety Net estimate: $($registryInfo.Reason)" -ForegroundColor Yellow
+        Write-LogEntry "WARN" "Restore-SafetyNet-Space" "Cannot read registry BasePath for estimate: $($registryInfo.Reason)" -Distro $DistroName
+    }
+
+    $requiredBytes = $Script:MinimumSafetyNetFreeSpaceBytes
+    if ($null -ne $estimatedBytes -and $estimatedBytes -gt 0) {
+        $bufferBytes = [long][math]::Max([math]::Ceiling([double]$estimatedBytes * 0.10), [double]1GB)
+        $requiredBytes = [long]($estimatedBytes + $bufferBytes)
+    }
+
+    if ($Global:DryRun) {
+        Write-Host "DRY RUN: would check Safety Net export free space at $SafetyNetPath" -ForegroundColor Yellow
+        if ($null -ne $estimatedBytes -and $estimatedBytes -gt 0) {
+            Write-Host "  DRY RUN: estimated Safety Net size from ${estimateSource}: $(Format-Bytes $estimatedBytes)" -ForegroundColor Yellow
+            Write-Host "  DRY RUN: required with buffer: $(Format-Bytes $requiredBytes)" -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "  DRY RUN: precise estimate unavailable; would require at least $(Format-Bytes $requiredBytes)" -ForegroundColor Yellow
+        }
+        Write-LogEntry "INFO" "Restore-SafetyNet-Space" "DryRun would check Safety Net space. Path=$SafetyNetPath | Estimate=$estimatedBytes | Required=$requiredBytes" -Distro $DistroName
+        return $true
+    }
+
+    $space = Get-WSLBMPathFreeSpaceInfo -Path $SafetyNetPath -Label "Safety Net export target" -LogAction "Restore-SafetyNet-Space" -Distro $DistroName
+    if (-not $space.Success) {
+        Write-Host "[ERROR] Safety Net export blocked because destination free space cannot be verified: $($space.Reason)" -ForegroundColor Red
+        Write-LogEntry "ERROR" "Restore-SafetyNet-Space" "Cannot verify Safety Net export space. Path=$SafetyNetPath | Reason=$($space.Reason)" -Distro $DistroName
+        return $false
+    }
+
+    Write-Host "  -> Safety Net Space Check" -ForegroundColor Cyan
+    Write-Host "     Target   : $SafetyNetPath" -ForegroundColor DarkGray
+    if ($null -ne $estimatedBytes -and $estimatedBytes -gt 0) {
+        Write-Host "     Estimate : $(Format-Bytes $estimatedBytes) ($estimateSource)" -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "     Estimate : unavailable; using minimum free-space guard" -ForegroundColor Yellow
+        Write-LogEntry "WARN" "Restore-SafetyNet-Space" "Precise Safety Net size estimate unavailable; using minimum guard $(Format-Bytes $requiredBytes). Path=$SafetyNetPath" -Distro $DistroName
+    }
+    Write-Host "     Required : $(Format-Bytes $requiredBytes)" -ForegroundColor DarkGray
+    Write-Host "     Available: $(Format-Bytes $space.AvailableBytes)" -ForegroundColor DarkGray
+    Write-LogEntry "INFO" "Restore-SafetyNet-Space" "Target=$SafetyNetPath | Estimate=$estimatedBytes | Required=$(Format-Bytes $requiredBytes) | Available=$(Format-Bytes $space.AvailableBytes) | Source=$($space.SourceType):$($space.SourceKey)" -Distro $DistroName
+
+    if ($space.AvailableBytes -lt $requiredBytes) {
+        Write-Host "[ERROR] Not enough free space for Safety Net export." -ForegroundColor Red
+        Write-Host "  Required : $(Format-Bytes $requiredBytes)" -ForegroundColor Yellow
+        Write-Host "  Available: $(Format-Bytes $space.AvailableBytes)" -ForegroundColor Yellow
+        Write-LogEntry "ERROR" "Restore-SafetyNet-Space" "Insufficient Safety Net export space. Required=$(Format-Bytes $requiredBytes) | Available=$(Format-Bytes $space.AvailableBytes) | Path=$SafetyNetPath" -Distro $DistroName
+        return $false
+    }
+
+    Write-Host "  [OK] Safety Net export space check passed." -ForegroundColor Green
+    return $true
 }
 
 function Invoke-GuardedWSLCommand {
@@ -2983,7 +3835,11 @@ function Invoke-GuardedWSLCommand {
         [Parameter(Mandatory = $true)]
         [string[]]$Arguments,
 
-        [string]$Distro = $Script:CurrentDistro
+        [string]$Distro = $Script:CurrentDistro,
+
+        [int]$TimeoutSeconds = $Script:DefaultWSLCommandTimeoutSeconds,
+
+        [bool]$AllowCancel = $true
     )
 
     $commandPreview = "wsl.exe " + ($Arguments -join " ")
@@ -2996,52 +3852,106 @@ function Invoke-GuardedWSLCommand {
             ExitCode             = $null
             SkippedBecauseDryRun = $true
             Description          = $Description
+            TimedOut             = $false
+            Cancelled            = $false
+            StdOut               = ""
+            StdErr               = ""
             Output               = ""
+            CombinedOutput       = ""
+            ErrorMessage         = ""
+            ProcessId            = $null
         }
     }
 
-    Write-LogEntry "INFO" "WSL-Command" "$Description | $commandPreview" -Distro $Distro
-    $output = & wsl.exe @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    $outputText = if ($output) { $output -join [Environment]::NewLine } else { "" }
+    $runnerResult = Invoke-WSLBMNativeProcessChecked `
+        -FilePath "wsl.exe" `
+        -Arguments $Arguments `
+        -OperationName "WSL-Command" `
+        -Description $Description `
+        -TimeoutSeconds $TimeoutSeconds `
+        -Distro $Distro `
+        -RegisterActiveProcess `
+        -AllowCancel:([bool]$AllowCancel)
 
-    if ($null -eq $exitCode) {
-        Write-Host "[ERROR] $Description failed: WSL command did not report an exit code." -ForegroundColor Red
+    $outputText = [string]$runnerResult.CombinedOutput
+
+    if (-not $runnerResult.Success) {
+        if ($runnerResult.TimedOut) {
+            Write-Host "[ERROR] $Description timed out after $TimeoutSeconds seconds." -ForegroundColor Red
+            Write-LogEntry "ERROR" "WSL-Command" "$Description timed out after $TimeoutSeconds seconds" -Distro $Distro
+        }
+        elseif ($runnerResult.Cancelled) {
+            Write-Host "[WARN] $Description cancelled by user." -ForegroundColor Yellow
+            Write-LogEntry "WARN" "WSL-Command" "$Description cancelled by user" -Distro $Distro
+        }
+        elseif ($null -eq $runnerResult.ExitCode) {
+            Write-Host "[ERROR] $Description failed: WSL command did not report an exit code." -ForegroundColor Red
+            Write-LogEntry "ERROR" "WSL-Command" "$Description failed: WSL command did not report an exit code" -Distro $Distro
+        }
+        else {
+            Write-Host "[ERROR] $Description failed (wsl.exe exit code $($runnerResult.ExitCode))." -ForegroundColor Red
+            Write-LogEntry "ERROR" "WSL-Command" "$Description failed with exit code $($runnerResult.ExitCode)" -Distro $Distro
+        }
         if ($outputText) {
             Write-Host $outputText -ForegroundColor DarkGray
         }
-        Write-LogEntry "ERROR" "WSL-Command" "$Description failed: WSL command did not report an exit code" -Distro $Distro
         return [pscustomobject]@{
             Success              = $false
-            ExitCode             = $null
+            ExitCode             = $runnerResult.ExitCode
             SkippedBecauseDryRun = $false
             Description          = $Description
+            TimedOut             = $runnerResult.TimedOut
+            Cancelled            = $runnerResult.Cancelled
+            StdOut               = $runnerResult.StdOut
+            StdErr               = $runnerResult.StdErr
             Output               = $outputText
-        }
-    }
-
-    if ($exitCode -ne 0) {
-        Write-Host "[ERROR] $Description failed (wsl.exe exit code $exitCode)." -ForegroundColor Red
-        if ($outputText) {
-            Write-Host $outputText -ForegroundColor DarkGray
-        }
-        Write-LogEntry "ERROR" "WSL-Command" "$Description failed with exit code $exitCode" -Distro $Distro
-        return [pscustomobject]@{
-            Success              = $false
-            ExitCode             = $exitCode
-            SkippedBecauseDryRun = $false
-            Description          = $Description
-            Output               = $outputText
+            CombinedOutput       = $outputText
+            ErrorMessage         = $runnerResult.ErrorMessage
+            ProcessId            = $runnerResult.ProcessId
         }
     }
 
     return [pscustomobject]@{
         Success              = $true
-        ExitCode             = $exitCode
+        ExitCode             = $runnerResult.ExitCode
         SkippedBecauseDryRun = $false
         Description          = $Description
+        TimedOut             = $false
+        Cancelled            = $false
+        StdOut               = $runnerResult.StdOut
+        StdErr               = $runnerResult.StdErr
         Output               = $outputText
+        CombinedOutput       = $outputText
+        ErrorMessage         = ""
+        ProcessId            = $runnerResult.ProcessId
     }
+}
+
+function Test-RestoreTarEntryPathMatch {
+    param(
+        [AllowNull()]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$EntryName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    if ([string]::Equals($Path, $EntryName, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    $leaf = Split-Path -Path $Path -Leaf -ErrorAction SilentlyContinue
+    if ([string]::Equals($leaf, $EntryName, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    $normalizedPath = $Path -replace '\\', '/'
+    $normalizedEntry = $EntryName -replace '\\', '/'
+    return $normalizedPath.EndsWith("/$normalizedEntry", [System.StringComparison]::OrdinalIgnoreCase)
 }
 
 function Get-RestoreTarSizeFromArchive {
@@ -3061,8 +3971,21 @@ function Get-RestoreTarSizeFromArchive {
     Write-LogEntry "INFO" "Restore-TempSpace" "Reading $EntryName size from $BackupFile" -Distro $Distro
 
     $argList = @("l", "-slt", $BackupFile, $EntryName)
-    $output = & $sevenZipExe @argList 2>&1
-    $exitCode = $LASTEXITCODE
+    $listResult = Invoke-WSLBMNativeProcessChecked `
+        -FilePath $sevenZipExe `
+        -Arguments $argList `
+        -OperationName "Restore-TempSpace" `
+        -Description "List restore tar entry metadata" `
+        -TimeoutSeconds $Script:RestoreExtractTimeoutSeconds `
+        -Distro $Distro
+    $exitCode = $listResult.ExitCode
+
+    if ($listResult.TimedOut) {
+        throw "7z list failed while reading restore tar size: timed out after $Script:RestoreExtractTimeoutSeconds seconds."
+    }
+    if ($listResult.Cancelled) {
+        throw "7z list failed while reading restore tar size: cancelled by user."
+    }
     if ($null -eq $exitCode) {
         throw "7z list failed while reading restore tar size: process did not report an exit code."
     }
@@ -3070,12 +3993,19 @@ function Get-RestoreTarSizeFromArchive {
         throw "7z list failed while reading restore tar size (exit code $exitCode)."
     }
 
+    $outputText = [string]$listResult.StdOut
+    if ([string]::IsNullOrWhiteSpace($outputText)) {
+        # Some native tools/environments do not keep metadata listing text solely on stdout.
+        # Use combined output only as a compatibility fallback after exit-code success.
+        $outputText = [string]$listResult.CombinedOutput
+    }
+    $output = @($outputText -split "\r?\n")
     $currentPath = $null
     $currentSize = $null
     foreach ($line in $output) {
         $text = [string]$line
         if ($text -match '^Path = (.+)$') {
-            if ($currentPath -eq $EntryName -and $null -ne $currentSize) {
+            if ((Test-RestoreTarEntryPathMatch -Path $currentPath -EntryName $EntryName) -and $null -ne $currentSize) {
                 return [long]$currentSize
             }
             $currentPath = $Matches[1].Trim()
@@ -3090,7 +4020,7 @@ function Get-RestoreTarSizeFromArchive {
         }
     }
 
-    if ($currentPath -eq $EntryName -and $null -ne $currentSize) {
+    if ((Test-RestoreTarEntryPathMatch -Path $currentPath -EntryName $EntryName) -and $null -ne $currentSize) {
         return [long]$currentSize
     }
 
@@ -3559,6 +4489,9 @@ function Test-WSLBMBackupDirectoryShape {
 }
 
 function Test-BackupDirectoryReparsePointSafety {
+    # This scan targets ReparsePoint entries such as junctions, directory symlinks, and mount points.
+    # It does not expand ordinary hard link files and is only a backup-delete boundary check,
+    # not a general proof that arbitrary directory deletion is safe.
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path,
@@ -3753,13 +4686,14 @@ function Invoke-ProtectedBackupPathDelete {
         Write-Host ("     Has .backup-in-progress  : {0}" -f $Shape.HasInProgressLock) -ForegroundColor DarkGray
         Write-Host ("     Directory shape          : Passed" ) -ForegroundColor DarkGray
         Write-Host ("     Reparse scan             : {0}" -f $scanStatus) -ForegroundColor DarkGray
+        Write-Host "     Reparse scan scope       : ReparsePoint-only; hard link files are not expanded." -ForegroundColor DarkGray
         Write-Host ("     Reparse point found      : {0}" -f $ReparsePointScan.HasReparsePoint) -ForegroundColor DarkGray
         Write-Host ("     Scanned directories      : {0}" -f $ReparsePointScan.ScannedDirectories) -ForegroundColor DarkGray
         Write-Host ("     Scanned items            : {0}" -f $ReparsePointScan.ScannedItems) -ForegroundColor DarkGray
         Write-Host ("     First reparse path       : {0}" -f $firstReparsePath) -ForegroundColor DarkGray
         Write-Host ("     Scan reason              : {0}" -f $scanReason) -ForegroundColor DarkGray
 
-        Write-LogEntry "INFO" "Delete-Audit" "Mode=$Mode | Target=$TargetPath | DryRun=$([bool]$Global:DryRun) | FromRecognizedBackupList=$([bool]$FromRecognizedBackupList) | RequireInProgressLock=$([bool]$RequireInProgressLock) | BackupType=$($Shape.BackupType) | HasInProgressLock=$($Shape.HasInProgressLock) | ReparseScan=$scanStatus | HasReparsePoint=$($ReparsePointScan.HasReparsePoint) | ScannedDirectories=$($ReparsePointScan.ScannedDirectories) | ScannedItems=$($ReparsePointScan.ScannedItems) | FirstReparsePath=$firstReparsePath | ScanReason=$scanReason | Reason=$Reason" -Distro $Distro
+        Write-LogEntry "INFO" "Delete-Audit" "Mode=$Mode | Target=$TargetPath | DryRun=$([bool]$Global:DryRun) | FromRecognizedBackupList=$([bool]$FromRecognizedBackupList) | RequireInProgressLock=$([bool]$RequireInProgressLock) | BackupType=$($Shape.BackupType) | HasInProgressLock=$($Shape.HasInProgressLock) | ReparseScan=$scanStatus | ReparseScanScope=ReparsePoint-only; hard link files are not expanded. | HasReparsePoint=$($ReparsePointScan.HasReparsePoint) | ScannedDirectories=$($ReparsePointScan.ScannedDirectories) | ScannedItems=$($ReparsePointScan.ScannedItems) | FirstReparsePath=$firstReparsePath | ScanReason=$scanReason | Reason=$Reason" -Distro $Distro
     }
 
     $targetResolved = Get-NormalizedWindowsPathForComparison -Path $Path -Label "Backup delete target"
@@ -4456,41 +5390,12 @@ function Test-PathFreeSpaceForRestorePayload {
             return $false
         }
 
-        $fullPath = [System.IO.Path]::GetFullPath($resolvedPath.CheckPath)
-        $root = [System.IO.Path]::GetPathRoot($fullPath)
-
-        if (-not [string]::IsNullOrWhiteSpace($root) -and $root -match '^[A-Za-z]:\\') {
-            $driveInfo = New-Object -TypeName System.IO.DriveInfo -ArgumentList $root
-            if (-not $driveInfo.IsReady) {
-                throw "Drive '$root' is not ready."
-            }
-            $availableBytes = [long]$driveInfo.AvailableFreeSpace
-            $spaceSource = $driveInfo.Name
+        $space = Get-WSLBMPathFreeSpaceInfo -Path $resolvedPath.CheckPath -Label $Label -LogAction "Restore-Space" -Distro $Distro
+        if (-not $space.Success) {
+            throw $space.Reason
         }
-
-        if ($null -eq $availableBytes) {
-            $matchedDrive = $null
-            foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction Stop)) {
-                if ($null -eq $drive.Free -or [string]::IsNullOrWhiteSpace($drive.Root)) {
-                    continue
-                }
-
-                if ($fullPath.StartsWith($drive.Root, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    if ($null -eq $matchedDrive -or $drive.Root.Length -gt $matchedDrive.Root.Length) {
-                        $matchedDrive = $drive
-                    }
-                }
-            }
-
-            if ($null -ne $matchedDrive) {
-                $availableBytes = [long]$matchedDrive.Free
-                $spaceSource = $matchedDrive.Name
-            }
-        }
-
-        if ($null -eq $availableBytes) {
-            throw "Cannot determine available free space for ${Label}: $Path"
-        }
+        $availableBytes = [long]$space.AvailableBytes
+        $spaceSource = "$($space.SourceType):$($space.SourceKey)"
 
         Write-Host "  -> Restore Space Check: $Label" -ForegroundColor Cyan
         Write-Host ("     Target    : {0}" -f $Path) -ForegroundColor DarkGray
@@ -4764,31 +5669,60 @@ function Expand-RestoreArchiveToTempTar {
         Write-LogEntry "INFO" "Restore-Extract" "Extracting $tarEntryName to $tempTar" -Distro $Distro
 
         $argList = @("e", $BackupFile, $tarEntryName, "-o$tempDir", "-y", "-bd")
-        $argsStr = Format-QuotedArgs $argList
         $previousIsActive = $Global:BackupState.IsActive
         $previousIsRunning = $Global:BackupState.IsRunning
         $previousOperation = $Global:BackupState.Operation
         $previousCurrentFile = $Global:BackupState.CurrentFile
         $previousCurrentDir = $Global:BackupState.CurrentDir
-        $proc = $null
         try {
-            $proc = Start-Process $sevenZipExe -ArgumentList $argsStr -NoNewWindow -PassThru
             $Global:BackupState.IsActive = $true
             $Global:BackupState.IsRunning = $true
             $Global:BackupState.Operation = "Restore-Extract"
             $Global:BackupState.CurrentFile = $BackupFile
             $Global:BackupState.CurrentDir = $tempDir
-            $Global:BackupState.ActiveProcess = $proc
-            $proc.WaitForExit()
-            $exitCode = $proc.ExitCode
+            $extractProcess = Invoke-WSLBMNativeProcessChecked `
+                -FilePath $sevenZipExe `
+                -Arguments $argList `
+                -OperationName "Restore-Extract" `
+                -Description "Extract restore tar from archive" `
+                -TimeoutSeconds $Script:RestoreExtractTimeoutSeconds `
+                -AllowCancel `
+                -RegisterActiveProcess `
+                -Distro $Distro
+            $exitCode = $extractProcess.ExitCode
         }
         finally {
-            $Global:BackupState.ActiveProcess = $null
             $Global:BackupState.IsActive = $previousIsActive
             $Global:BackupState.IsRunning = $previousIsRunning
             $Global:BackupState.Operation = $previousOperation
             $Global:BackupState.CurrentFile = $previousCurrentFile
             $Global:BackupState.CurrentDir = $previousCurrentDir
+        }
+        if ($extractProcess.TimedOut) {
+            Write-Host "[ERROR] Failed to extract restore tar: 7z timed out." -ForegroundColor Red
+            Write-LogEntry "ERROR" "Restore-Extract" "7z timed out after $Script:RestoreExtractTimeoutSeconds seconds" -Distro $Distro
+            return [pscustomobject]@{
+                Success              = $false
+                ExitCode             = $exitCode
+                SkippedBecauseDryRun = $false
+                TimedOut             = $true
+                Cancelled            = $false
+                TempDir              = $tempDir
+                TempTar              = $tempTar
+            }
+        }
+        if ($extractProcess.Cancelled) {
+            Write-Host "[WARN] Restore tar extraction cancelled by user." -ForegroundColor Yellow
+            Write-LogEntry "WARN" "Restore-Extract" "7z extraction cancelled by user" -Distro $Distro
+            return [pscustomobject]@{
+                Success              = $false
+                ExitCode             = $exitCode
+                SkippedBecauseDryRun = $false
+                TimedOut             = $false
+                Cancelled            = $true
+                TempDir              = $tempDir
+                TempTar              = $tempTar
+            }
         }
         if ($null -eq $exitCode) {
             Write-Host "[ERROR] Failed to extract restore tar: 7z did not report an exit code." -ForegroundColor Red
@@ -4797,6 +5731,8 @@ function Expand-RestoreArchiveToTempTar {
                 Success              = $false
                 ExitCode             = $null
                 SkippedBecauseDryRun = $false
+                TimedOut             = $false
+                Cancelled            = $false
                 TempDir              = $tempDir
                 TempTar              = $tempTar
             }
@@ -4808,6 +5744,8 @@ function Expand-RestoreArchiveToTempTar {
                 Success              = $false
                 ExitCode             = $exitCode
                 SkippedBecauseDryRun = $false
+                TimedOut             = $false
+                Cancelled            = $false
                 TempDir              = $tempDir
                 TempTar              = $tempTar
             }
@@ -4888,6 +5826,48 @@ function Invoke-RestoreImportFromTar {
     return $importResult
 }
 
+function Get-RestoreSafetyNetManifestPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SafetyNetPath
+    )
+
+    $parent = [System.IO.Path]::GetDirectoryName($SafetyNetPath)
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($SafetyNetPath)
+    return (Join-Path $parent "$baseName.manifest.json")
+}
+
+function Write-RestoreSafetyNetManifest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DistroName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SafetyNetPath
+    )
+
+    $safetyItem = Get-Item -LiteralPath $SafetyNetPath -ErrorAction Stop
+    $safetyHash = Get-FileHash -LiteralPath $safetyItem.FullName -Algorithm SHA256 -ErrorAction Stop
+    $manifestPath = Get-RestoreSafetyNetManifestPath -SafetyNetPath $safetyItem.FullName
+
+    $manifest = [ordered]@{
+        SchemaVersion     = 1
+        ManifestType      = "SafetyNet"
+        OperationId       = $Script:CurrentOperationId
+        CreatedAt         = (Get-Date).ToString("o")
+        SourceDistro      = $DistroName
+        SafetyNetPath     = $safetyItem.FullName
+        SafetyNetFileName = $safetyItem.Name
+        ArchiveSizeBytes  = [long]$safetyItem.Length
+        ArchiveSha256     = [string]$safetyHash.Hash
+        Purpose           = "FULL overwrite restore safety net"
+        ScriptVersion     = Get-WSLBMScriptVersion
+    }
+
+    Write-WSLBMTextFileUtf8NoBom -LiteralPath $manifestPath -Content ($manifest | ConvertTo-Json -Depth 4)
+    return $manifestPath
+}
+
 function New-RestoreSafetyNetBackup {
     param(
         [Parameter(Mandatory = $true)]
@@ -4921,6 +5901,12 @@ function New-RestoreSafetyNetBackup {
     Write-LogEntry "INFO" "Restore-SafetyNet" "Creating Safety Net: $safetyFile" -Distro $DistroName
 
     try {
+        if (-not (Test-RestoreSafetyNetExportSpace -DistroName $DistroName -SafetyNetPath $safetyFile)) {
+            Write-Host "[ERROR] Safety Net export blocked before any WSL export because space pre-flight failed." -ForegroundColor Red
+            Write-LogEntry "ERROR" "Restore-SafetyNet" "Safety Net export blocked by space pre-flight: $safetyFile" -Distro $DistroName
+            return $null
+        }
+
         if ($Global:DryRun) {
             # WSL high-risk boundary: Safety Net preview still uses the guarded wrapper, which short-circuits in DryRun.
             $null = Invoke-GuardedWSLCommand -Description "Shutdown WSL for Safety Net" -Arguments @("--shutdown") -Distro $DistroName
@@ -4950,22 +5936,32 @@ function New-RestoreSafetyNetBackup {
             return $null
         }
 
-        if (-not (Test-Path $safetyFile -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $safetyFile -PathType Leaf)) {
             Write-Host "[ERROR] Safety Net export failed: file was not created." -ForegroundColor Red
             Write-LogEntry "ERROR" "Restore-SafetyNet" "Safety Net file missing: $safetyFile" -Distro $DistroName
             return $null
         }
 
-        $safetyItem = Get-Item $safetyFile
-        if ($safetyItem.Length -lt 1KB) {
-            Write-Host "[ERROR] Safety Net export failed: file is too small ($(Format-Bytes $safetyItem.Length))." -ForegroundColor Red
-            Write-LogEntry "ERROR" "Restore-SafetyNet" "Safety Net file too small: $($safetyItem.Length) bytes" -Distro $DistroName
+        $safetyItem = Get-Item -LiteralPath $safetyFile -ErrorAction Stop
+        if ($safetyItem.Length -lt $Script:MinimumSafetyNetArchiveBytes) {
+            Write-Host "[ERROR] Safety Net export failed: file is too small ($(Format-Bytes $safetyItem.Length); minimum $(Format-Bytes $Script:MinimumSafetyNetArchiveBytes))." -ForegroundColor Red
+            Write-LogEntry "ERROR" "Restore-SafetyNet" "Safety Net file too small. Path=$safetyFile | Actual=$($safetyItem.Length) | Minimum=$Script:MinimumSafetyNetArchiveBytes" -Distro $DistroName
             return $null
         }
 
         if (-not (Test-SafetyNetArchive -safetyFile $safetyFile)) {
             Write-LogEntry "ERROR" "Restore-SafetyNet" "Safety Net archive validation failed: $safetyFile" -Distro $DistroName
             return $null
+        }
+
+        try {
+            $manifestPath = Write-RestoreSafetyNetManifest -DistroName $DistroName -SafetyNetPath $safetyFile
+            Write-Host "Safety Net manifest written: $manifestPath" -ForegroundColor Green
+            Write-LogEntry "INFO" "Restore-SafetyNet-Manifest" "Safety Net manifest written: $manifestPath" -Distro $DistroName
+        }
+        catch {
+            Write-Host "[WARN] Safety Net tar exists and passed validation, but manifest write failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-LogEntry "WARN" "Restore-SafetyNet-Manifest" "Safety Net manifest write failed for ${safetyFile}: $($_.Exception.Message)" -Distro $DistroName
         }
 
         $safetySize = Format-Bytes $safetyItem.Length
@@ -5011,6 +6007,165 @@ function Confirm-RestoreSafetyNetCreation {
 
     Write-LogEntry "WARN" "Restore-SafetyNet-Confirm" "Safety Net creation confirmed with exact phrase" -Distro $DistroName
     return $true
+}
+
+function Read-RestoreSafetyNetManifestBestEffort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SafetyNetPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DistroName
+    )
+
+    $manifestPath = Get-RestoreSafetyNetManifestPath -SafetyNetPath $SafetyNetPath
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        Write-LogEntry "WARN" "Restore-SafetyNet-Manifest" "Safety Net manifest unavailable: $manifestPath" -Distro $DistroName
+        return [pscustomobject]@{
+            Success      = $false
+            ManifestPath = $manifestPath
+            Manifest     = $null
+            Reason       = "Manifest file was not found."
+        }
+    }
+
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        return [pscustomobject]@{
+            Success      = $true
+            ManifestPath = $manifestPath
+            Manifest     = $manifest
+            Reason       = ""
+        }
+    }
+    catch {
+        Write-LogEntry "WARN" "Restore-SafetyNet-Manifest" "Safety Net manifest read failed: $manifestPath | $($_.Exception.Message)" -Distro $DistroName
+        return [pscustomobject]@{
+            Success      = $false
+            ManifestPath = $manifestPath
+            Manifest     = $null
+            Reason       = $_.Exception.Message
+        }
+    }
+}
+
+function Invoke-RestoreSafetyNetRollbackPrompt {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DistroName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$InstallPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SafetyNetPath,
+
+        [object]$OverwritePathInfo = $null
+    )
+
+    $detectedBasePath = "<unavailable>"
+    if ($null -ne $OverwritePathInfo -and
+        -not [string]::IsNullOrWhiteSpace([string]$OverwritePathInfo.DetectedBasePath)) {
+        $detectedBasePath = [string]$OverwritePathInfo.DetectedBasePath
+    }
+
+    $manifestInfo = Read-RestoreSafetyNetManifestBestEffort -SafetyNetPath $SafetyNetPath -DistroName $DistroName
+    Write-Host ""
+    Write-Host "[Safety Net Rollback Available]" -ForegroundColor Yellow
+    Write-Host "Target distro        : $DistroName" -ForegroundColor Yellow
+    Write-Host "Original install path: $detectedBasePath" -ForegroundColor Yellow
+    Write-Host "Rollback import path : $InstallPath" -ForegroundColor Yellow
+    Write-Host "Safety Net tar       : $SafetyNetPath" -ForegroundColor Yellow
+
+    if ($manifestInfo.Success) {
+        $manifest = $manifestInfo.Manifest
+        $hash = [string]$manifest.ArchiveSha256
+        $hashPrefix = if ($hash.Length -gt 12) { $hash.Substring(0, 12) } else { $hash }
+        Write-Host "Safety Net manifest  : $($manifestInfo.ManifestPath)" -ForegroundColor Yellow
+        Write-Host "  OperationId        : $($manifest.OperationId)" -ForegroundColor DarkGray
+        Write-Host "  ArchiveSizeBytes   : $($manifest.ArchiveSizeBytes)" -ForegroundColor DarkGray
+        Write-Host "  ArchiveSha256      : $hashPrefix..." -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "Safety Net manifest  : unavailable ($($manifestInfo.Reason))" -ForegroundColor Yellow
+    }
+
+    if ($Global:DryRun) {
+        Write-Host "DRY RUN: this would execute wsl --import to re-import the Safety Net tar." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "This will execute wsl --import to re-import the Safety Net tar." -ForegroundColor Red
+    }
+    Write-LogEntry "WARN" "Restore-SafetyNet-Rollback" "Safety Net rollback option shown. Distro=$DistroName | InstallPath=$InstallPath | SafetyNet=$SafetyNetPath | Manifest=$($manifestInfo.ManifestPath)" -Distro $DistroName
+
+    $answer = Read-Host "Attempt Safety Net rollback? Type Y to continue"
+    if ($answer -cne "Y") {
+        Write-Host "Safety Net rollback skipped by user." -ForegroundColor Yellow
+        Write-LogEntry "WARN" "Restore-SafetyNet-Rollback" "Safety Net rollback skipped by user" -Distro $DistroName
+        return [pscustomobject]@{
+            Completed           = $false
+            Attempted           = $false
+            SkippedBecauseDryRun = $false
+            ManualHintNeeded    = $true
+        }
+    }
+
+    $requiredPhrase = "RESTORE SAFETY NET $DistroName"
+    Write-Host "Type the exact phrase below to execute Safety Net rollback:" -ForegroundColor Yellow
+    Write-Host "  $requiredPhrase" -ForegroundColor Cyan
+    $confirm = Read-Host "Safety Net rollback confirmation"
+    if ($confirm -cne $requiredPhrase) {
+        Write-Host "Safety Net rollback confirmation phrase did not match. No import was attempted." -ForegroundColor Red
+        Write-LogEntry "WARN" "Restore-SafetyNet-Rollback" "Safety Net rollback confirmation phrase mismatch; import not attempted" -Distro $DistroName
+        return [pscustomobject]@{
+            Completed           = $false
+            Attempted           = $false
+            SkippedBecauseDryRun = $false
+            ManualHintNeeded    = $true
+        }
+    }
+
+    if ($Global:DryRun) {
+        Write-Host "DRY RUN: would import Safety Net tar into $InstallPath for distro $DistroName" -ForegroundColor Yellow
+        Write-LogEntry "INFO" "Restore-SafetyNet-Rollback" "DryRun would run Safety Net rollback import. Distro=$DistroName | InstallPath=$InstallPath | SafetyNet=$SafetyNetPath" -Distro $DistroName
+        return [pscustomobject]@{
+            Completed           = $false
+            Attempted           = $false
+            SkippedBecauseDryRun = $true
+            ManualHintNeeded    = $false
+        }
+    }
+
+    try {
+        Write-LogEntry "WARN" "Restore-SafetyNet-Rollback" "Attempting Safety Net rollback import. Distro=$DistroName | InstallPath=$InstallPath | SafetyNet=$SafetyNetPath" -Distro $DistroName
+        $rollbackResult = Invoke-GuardedWSLCommand `
+            -Description "Import Safety Net rollback" `
+            -Arguments @("--import", $DistroName, $InstallPath, $SafetyNetPath) `
+            -Distro $DistroName
+
+        if (-not $rollbackResult.Success) {
+            throw "Safety Net rollback import failed with exit code $($rollbackResult.ExitCode). $($rollbackResult.Output)"
+        }
+
+        Write-Host "Safety Net rollback completed." -ForegroundColor Green
+        Write-LogEntry "INFO" "Restore-SafetyNet-Rollback" "Safety Net rollback completed. Distro=$DistroName | InstallPath=$InstallPath | SafetyNet=$SafetyNetPath" -Distro $DistroName
+        return [pscustomobject]@{
+            Completed           = $true
+            Attempted           = $true
+            SkippedBecauseDryRun = $false
+            ManualHintNeeded    = $false
+        }
+    }
+    catch {
+        Write-Host "[ERROR] Safety Net rollback failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-LogEntry "ERROR" "Restore-SafetyNet-Rollback" "Safety Net rollback failed: $($_.Exception.Message)" -Distro $DistroName
+        return [pscustomobject]@{
+            Completed           = $false
+            Attempted           = $true
+            SkippedBecauseDryRun = $false
+            ManualHintNeeded    = $true
+        }
+    }
 }
 
 function Confirm-OverwriteRestoreDestructiveStep {
@@ -5179,42 +6334,9 @@ function Get-FullBackupFreeSpaceInfo {
             }
         }
 
-        $fullPath = [System.IO.Path]::GetFullPath($resolvedPath.CheckPath)
-        $root = [System.IO.Path]::GetPathRoot($fullPath)
-        $availableBytes = $null
-        $sourceKey = ""
-
-        if (-not [string]::IsNullOrWhiteSpace($root) -and $root -match '^[A-Za-z]:\\') {
-            $driveInfo = New-Object -TypeName System.IO.DriveInfo -ArgumentList $root
-            if (-not $driveInfo.IsReady) {
-                throw "Drive '$root' is not ready."
-            }
-            $availableBytes = [long]$driveInfo.AvailableFreeSpace
-            $sourceKey = $driveInfo.Name
-        }
-
-        if ($null -eq $availableBytes) {
-            $matchedDrive = $null
-            foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction Stop)) {
-                if ($null -eq $drive.Free -or [string]::IsNullOrWhiteSpace($drive.Root)) {
-                    continue
-                }
-
-                if ($fullPath.StartsWith($drive.Root, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    if ($null -eq $matchedDrive -or $drive.Root.Length -gt $matchedDrive.Root.Length) {
-                        $matchedDrive = $drive
-                    }
-                }
-            }
-
-            if ($null -ne $matchedDrive) {
-                $availableBytes = [long]$matchedDrive.Free
-                $sourceKey = $matchedDrive.Root
-            }
-        }
-
-        if ($null -eq $availableBytes) {
-            throw "Cannot determine available free space for ${Label}: $Path"
+        $space = Get-WSLBMPathFreeSpaceInfo -Path $resolvedPath.CheckPath -Label $Label -LogAction "Backup-Full-Space" -Distro $Distro
+        if (-not $space.Success) {
+            throw $space.Reason
         }
 
         return [pscustomobject]@{
@@ -5222,8 +6344,8 @@ function Get-FullBackupFreeSpaceInfo {
             TargetPath     = $Path
             CheckPath      = $resolvedPath.CheckPath
             FullPath       = $resolvedPath.FullPath
-            AvailableBytes = $availableBytes
-            SourceKey      = $sourceKey
+            AvailableBytes = [long]$space.AvailableBytes
+            SourceKey      = "$($space.SourceType):$($space.SourceKey)"
             Reason         = ""
         }
     }
@@ -5624,6 +6746,9 @@ function Invoke-FullBackupWSLProcessChecked {
         [string]$Distro = $Script:CurrentDistro
     )
 
+    # Compatibility parameter retained for older FULL backup call sites.
+    $null = $MonitoredFile
+
     $commandPreview = "wsl.exe " + (Format-QuotedArgs $Arguments)
     if ($Global:DryRun) {
         Write-Host "DRY RUN: would run $commandPreview" -ForegroundColor Yellow
@@ -5637,17 +6762,23 @@ function Invoke-FullBackupWSLProcessChecked {
 
     Write-LogEntry "INFO" "Backup-Full-WSL" "$Description | $commandPreview" -Distro $Distro
 
-    $proc = Start-Process "wsl.exe" -ArgumentList (Format-QuotedArgs $Arguments) -PassThru -NoNewWindow
-    $Global:BackupState.ActiveProcess = $proc
+    $runnerResult = Invoke-WSLBMNativeProcessChecked `
+        -FilePath "wsl.exe" `
+        -Arguments $Arguments `
+        -OperationName "Backup-Full-WSL" `
+        -Description $Description `
+        -TimeoutSeconds $Script:DefaultWSLCommandTimeoutSeconds `
+        -AllowCancel:([bool]$EnableCancelMonitor) `
+        -RegisterActiveProcess `
+        -Distro $Distro
+    $exitCode = $runnerResult.ExitCode
 
-    if ($EnableCancelMonitor) {
-        Watch-Process-With-Monitor -Process $proc -MonitoredFile $MonitoredFile
+    if ($runnerResult.TimedOut) {
+        throw "$Description failed: wsl.exe timed out after $Script:DefaultWSLCommandTimeoutSeconds seconds."
     }
-
-    $proc.WaitForExit()
-    $exitCode = $proc.ExitCode
-    $Global:BackupState.ActiveProcess = $null
-
+    if ($runnerResult.Cancelled) {
+        throw "$Description failed: cancelled by user."
+    }
     if ($null -eq $exitCode) {
         throw "$Description failed: wsl.exe did not report an exit code."
     }
@@ -5731,20 +6862,27 @@ function Compress-FullBackupTarToArchive {
     $sevenZipExe = Resolve-FullBackup7zPath
     $mx = "-mx$($Global:Config.CompressionLevel)"
     $rawArgs = @("a", $BackupFile, "wsl-export.tar", $mx, "-mmt=$Threads", "-bsp1", "-y")
-    $safeArgs = Format-QuotedArgs $rawArgs
 
     Write-Host "Compressing temporary tar to wsl-full.7z (Press Q to cancel)..." -ForegroundColor Cyan
     Write-LogEntry "INFO" "Backup-Full-7z" "Compressing wsl-export.tar to $BackupFile"
 
-    $proc = Start-Process $sevenZipExe -ArgumentList $safeArgs -WorkingDirectory $TempDir -PassThru -NoNewWindow
-    $Global:BackupState.ActiveProcess = $proc
+    $runnerResult = Invoke-WSLBMNativeProcessChecked `
+        -FilePath $sevenZipExe `
+        -Arguments $rawArgs `
+        -OperationName "Backup-Full-7z" `
+        -Description "Compress full backup tar" `
+        -AllowCancel `
+        -RegisterActiveProcess `
+        -WorkingDirectory $TempDir `
+        -Distro $Script:CurrentDistro
+    $exitCode = $runnerResult.ExitCode
 
-    Watch-Process-With-Monitor -Process $proc -MonitoredFile $BackupFile
-    $proc.WaitForExit()
-
-    $exitCode = $proc.ExitCode
-    $Global:BackupState.ActiveProcess = $null
-
+    if ($runnerResult.TimedOut) {
+        throw "7z compression failed: timed out."
+    }
+    if ($runnerResult.Cancelled) {
+        throw "7z compression failed: cancelled by user."
+    }
     if ($null -eq $exitCode) {
         throw "7z compression failed: process did not report an exit code."
     }
@@ -6092,7 +7230,7 @@ function New-FullBackup {
         Write-Host "Add note (optional, press Enter to skip):"
         $note = Read-Host
         if (-not [string]::IsNullOrWhiteSpace($note)) {
-            $note | Out-File (Join-Path $backupDir "note.txt") -Encoding UTF8
+            Write-WSLBMTextFileUtf8NoBom -LiteralPath (Join-Path $backupDir "note.txt") -Content $note
         }
 
     }
@@ -6203,7 +7341,6 @@ function New-UserBackup {
     try {
         $mx = "-mx$($Global:Config.CompressionLevel)"
         $rawArgs = @("a", $backupFile, "$src\*", $mx, "-mmt=$safeThreads", "-bsp1")
-        $safeArgs = Format-QuotedArgs $rawArgs
 
         $sevenZipExe = Resolve-UserCustomBackup7zPath
 
@@ -6212,15 +7349,23 @@ function New-UserBackup {
         Write-Host "  Archive     : $backupFile" -ForegroundColor DarkGray
         Write-Host "Executing backup (Press Q to cancel)..." -ForegroundColor Cyan
 
-        $proc = Start-Process $sevenZipExe -ArgumentList $safeArgs -PassThru -NoNewWindow
-        $Global:BackupState.ActiveProcess = $proc
+        $backupProcess = Invoke-WSLBMNativeProcessChecked `
+            -FilePath $sevenZipExe `
+            -Arguments $rawArgs `
+            -OperationName "Backup-User-7z" `
+            -Description "Create USER backup archive" `
+            -AllowCancel `
+            -RegisterActiveProcess `
+            -Distro $Script:CurrentDistro
 
-        Watch-Process-With-Monitor -Process $proc -MonitoredFile $backupFile
-
-        $proc.WaitForExit()
-
-        # Fail closed: null ExitCode is also a 7z failure.
-        $exitCode = $proc.ExitCode
+        # Fail closed: timeout, cancel, and null ExitCode are also 7z failures.
+        $exitCode = $backupProcess.ExitCode
+        if ($backupProcess.TimedOut) {
+            throw "7z backup failed: timed out."
+        }
+        if ($backupProcess.Cancelled) {
+            throw "7z backup failed: cancelled by user."
+        }
         if ($null -eq $exitCode) {
             throw "7z backup failed: process did not report an exit code."
         }
@@ -6275,7 +7420,7 @@ function New-UserBackup {
         Write-Host "Add note (optional):"
         $note = Read-Host
         if (-not [string]::IsNullOrWhiteSpace($note)) {
-            $note | Out-File (Join-Path $backupDir "note.txt") -Encoding UTF8
+            Write-WSLBMTextFileUtf8NoBom -LiteralPath (Join-Path $backupDir "note.txt") -Content $note
         }
 
     }
@@ -6397,7 +7542,6 @@ function New-CustomBackup {
     try {
         $mx = "-mx$($Global:Config.CompressionLevel)"
         $rawArgs = @("a", $backupFile, $src, $mx, "-mmt=$safeThreads", "-bsp1")
-        $safeArgs = Format-QuotedArgs $rawArgs
 
         $sevenZipExe = Resolve-UserCustomBackup7zPath
 
@@ -6407,15 +7551,23 @@ function New-CustomBackup {
         Write-Host "  Archive     : $backupFile" -ForegroundColor DarkGray
         Write-Host "Executing backup (Press Q to cancel)..." -ForegroundColor Cyan
 
-        $proc = Start-Process $sevenZipExe -ArgumentList $safeArgs -PassThru -NoNewWindow
-        $Global:BackupState.ActiveProcess = $proc
+        $backupProcess = Invoke-WSLBMNativeProcessChecked `
+            -FilePath $sevenZipExe `
+            -Arguments $rawArgs `
+            -OperationName "Backup-Custom-7z" `
+            -Description "Create CUSTOM backup archive" `
+            -AllowCancel `
+            -RegisterActiveProcess `
+            -Distro $Script:CurrentDistro
 
-        Watch-Process-With-Monitor -Process $proc -MonitoredFile $backupFile
-
-        $proc.WaitForExit()
-
-        # Fail closed: null ExitCode is also a 7z failure.
-        $exitCode = $proc.ExitCode
+        # Fail closed: timeout, cancel, and null ExitCode are also 7z failures.
+        $exitCode = $backupProcess.ExitCode
+        if ($backupProcess.TimedOut) {
+            throw "7z backup failed: timed out."
+        }
+        if ($backupProcess.Cancelled) {
+            throw "7z backup failed: cancelled by user."
+        }
         if ($null -eq $exitCode) {
             throw "7z backup failed: process did not report an exit code."
         }
@@ -6472,7 +7624,7 @@ function New-CustomBackup {
         Write-Host "Add note (optional):"
         $note = Read-Host
         if (-not [string]::IsNullOrWhiteSpace($note)) {
-            $note | Out-File (Join-Path $backupDir "note.txt") -Encoding UTF8
+            Write-WSLBMTextFileUtf8NoBom -LiteralPath (Join-Path $backupDir "note.txt") -Content $note
         }
 
     }
@@ -6529,13 +7681,25 @@ function Show-RestoreMenu {
         return
     }
 
+    $showAllBackups = $false
     $displayedBackupCount = Get-DisplayedBackupCount -Backups $backups
     Show-BackupTable -Backups $backups
 
     while ($true) {
-        $sel = Read-Host "Select backup number (or 0/q to cancel)"
+        $sel = Read-Host "Select backup number (A = show all, 0/q = cancel)"
         if ($sel -eq "0" -or $sel -eq "q" -or $sel -eq "Q") {
             return
+        }
+        if ($sel -eq "a" -or $sel -eq "A") {
+            if ($showAllBackups) {
+                Write-Host "All recognized backups are already visible." -ForegroundColor Yellow
+            }
+            else {
+                $showAllBackups = $true
+                $displayedBackupCount = $backups.Count
+                Show-BackupTable -Backups $backups -ShowAll
+            }
+            continue
         }
 
         if ($sel -match '^\d+$') {
@@ -6545,12 +7709,12 @@ function Show-RestoreMenu {
                 break
             }
             if ($selNum -gt $displayedBackupCount -and $selNum -le $backups.Count) {
-                Write-Host "Selection $selNum is not visible. Only entries 1-$displayedBackupCount can be restored from this screen." -ForegroundColor Red
+                Write-Host "Selection $selNum is not visible. Enter A to show all recognized backups first." -ForegroundColor Red
                 continue
             }
         }
 
-        Write-Host "Invalid selection. Enter a visible backup number from 1-$displayedBackupCount, or 0/q to cancel." -ForegroundColor Red
+        Write-Host "Invalid selection. Enter a visible backup number from 1-$displayedBackupCount, A to show all, or 0/q to cancel." -ForegroundColor Red
     }
 
     Write-LogEntry "INFO" "Restore-Init" "Selected $($target.Name)"
@@ -6885,10 +8049,26 @@ function Invoke-RestoreStream {
         Write-Host "[ERROR] RESTORE FAILED: $errMsg" -ForegroundColor Red
 
         if ($isOverwrite) {
-            Write-Host ""
-            Write-Host "[CRITICAL] Original system was unregistered!" -ForegroundColor Yellow
-            Write-Host "If you created a Safety Net, you can restore it with:" -ForegroundColor Yellow
-            Write-Host "  wsl --import $distroName <path> <safety-net.tar>" -ForegroundColor Cyan
+            $manualRecoveryHintNeeded = $true
+            if (-not [string]::IsNullOrWhiteSpace([string]$SafetyNetPath) -and
+                (Test-Path -LiteralPath $SafetyNetPath -PathType Leaf)) {
+                $rollbackResult = Invoke-RestoreSafetyNetRollbackPrompt `
+                    -DistroName $distroName `
+                    -InstallPath $installPath `
+                    -SafetyNetPath $SafetyNetPath `
+                    -OverwritePathInfo $OverwritePathInfo
+                $manualRecoveryHintNeeded = [bool]$rollbackResult.ManualHintNeeded
+            }
+            else {
+                Write-LogEntry "WARN" "Restore-SafetyNet-Rollback" "Safety Net rollback unavailable. SafetyNetPath='$SafetyNetPath'" -Distro $distroName
+            }
+
+            if ($manualRecoveryHintNeeded) {
+                Write-Host ""
+                Write-Host "[CRITICAL] Original system was unregistered!" -ForegroundColor Yellow
+                Write-Host "If you created a Safety Net, you can restore it with:" -ForegroundColor Yellow
+                Write-Host "  wsl --import $distroName <path> <safety-net.tar>" -ForegroundColor Cyan
+            }
         }
 
         Stop-ActiveBackupProcesses
@@ -6980,7 +8160,7 @@ function Resolve-SafeUserCustomBackupRelativePath {
         }
     }
 
-    $segments = $cleanPath.Split([char[]]@('/'), [System.StringSplitOptions]::None)
+    $segments = $cleanPath -split '/'
     foreach ($segment in $segments) {
         if ($segment.Length -eq 0) {
             return [pscustomobject]@{
@@ -7253,7 +8433,6 @@ function Invoke-RestoreUserData {
 
     try {
         $rawArgs = @("x", $backupFile, "-o$dest", "-aoa", "-bsp1")
-        $safeArgs = Format-QuotedArgs $rawArgs
 
         if (-not (Confirm-UserCustomRestoreOverwrite `
                     -RestoreType $restoreType `
@@ -7287,14 +8466,22 @@ function Invoke-RestoreUserData {
 
         $sevenZipExe = Resolve-UserCustomRestore7zPath
         Write-Host "Extracting with 7-Zip (Press Q to cancel)..." -ForegroundColor Cyan
-        $proc = Start-Process $sevenZipExe -ArgumentList $safeArgs -PassThru -NoNewWindow
-        $Global:BackupState.ActiveProcess = $proc
+        $restoreProcess = Invoke-WSLBMNativeProcessChecked `
+            -FilePath $sevenZipExe `
+            -Arguments $rawArgs `
+            -OperationName "Restore-User-7z" `
+            -Description "Extract USER/CUSTOM restore archive" `
+            -AllowCancel `
+            -RegisterActiveProcess `
+            -Distro $Script:CurrentDistro
+        $exitCode = $restoreProcess.ExitCode
 
-        Watch-Process-With-Monitor -Process $proc -MonitoredFile $backupFile
-        $proc.WaitForExit()
-        $exitCode = $proc.ExitCode
-        $Global:BackupState.ActiveProcess = $null
-
+        if ($restoreProcess.TimedOut) {
+            throw "7z restore failed: timed out."
+        }
+        if ($restoreProcess.Cancelled) {
+            throw "7z restore failed: cancelled by user."
+        }
         if ($null -eq $exitCode) {
             throw "7z restore failed: process did not report an exit code."
         }
@@ -7397,21 +8584,33 @@ function Remove-BatchBackups {
         return
     }
 
+    $showAllBackups = $false
     $displayedBackupCount = Get-DisplayedBackupCount -Backups $backups
     Show-BackupTable -Backups $backups
 
     $targets = @()
     while ($true) {
         Write-Host ""
-        $inputStr = Read-Host "Enter visible numbers to delete (comma separated, e.g. 1,3,5) or 0/q to cancel"
+        $inputStr = Read-Host "Enter visible numbers to delete (comma separated), A to show all, or 0/q to cancel"
 
         if ($inputStr -eq "q" -or $inputStr -eq "Q" -or $inputStr -eq "0") {
             return
         }
+        if ($inputStr -eq "a" -or $inputStr -eq "A") {
+            if ($showAllBackups) {
+                Write-Host "All recognized backups are already visible." -ForegroundColor Yellow
+            }
+            else {
+                $showAllBackups = $true
+                $displayedBackupCount = $backups.Count
+                Show-BackupTable -Backups $backups -ShowAll
+            }
+            continue
+        }
 
         $tokens = @($inputStr -split "," | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         if ($tokens.Count -eq 0) {
-            Write-Host "No selections entered. Use visible numbers 1-$displayedBackupCount, or 0/q to cancel." -ForegroundColor Yellow
+            Write-Host "No selections entered. Use visible numbers 1-$displayedBackupCount, A to show all, or 0/q to cancel." -ForegroundColor Yellow
             continue
         }
 
@@ -7434,12 +8633,12 @@ function Remove-BatchBackups {
 
         if ($invalidTokens.Count -gt 0) {
             Write-Host "Invalid selection token(s): $($invalidTokens -join ', ')." -ForegroundColor Red
-            Write-Host "Only visible backup entries 1-$displayedBackupCount can be deleted from this screen." -ForegroundColor Yellow
+            Write-Host "Only visible backup entries 1-$displayedBackupCount can be deleted from this screen. Enter A to show all recognized backups first." -ForegroundColor Yellow
             continue
         }
 
         if ($targets.Count -eq 0) {
-            Write-Host "No valid selections. Use visible numbers 1-$displayedBackupCount, or 0/q to cancel." -ForegroundColor Yellow
+            Write-Host "No valid selections. Use visible numbers 1-$displayedBackupCount, A to show all, or 0/q to cancel." -ForegroundColor Yellow
             continue
         }
 
@@ -7729,7 +8928,7 @@ function Show-MainMenu {
     $adminTag = if ($isAdmin) { " [ADMIN]" } else { "" }
 
     Write-Host ""
-    Write-Host "=== WSL Backup Manager v4.01$adminTag ===" -ForegroundColor Cyan
+    Write-Host "=== WSL Backup Manager $(Get-WSLBMScriptVersion)$adminTag ===" -ForegroundColor Cyan
     Write-Host "  DISTRO : $Script:CurrentDistro" -ForegroundColor Green
     $modeText = if ($Global:DryRun) { "DRY RUN" } else { "NORMAL" }
     $modeColor = if ($Global:DryRun) { [ConsoleColor]::Yellow } else { [ConsoleColor]::Green }
