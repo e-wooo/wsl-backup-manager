@@ -1,10 +1,10 @@
-# WSL Backup Manager v4.01
+# WSL Backup Manager v4.1
 
 Language: [English](#english) | [中文](#%E4%B8%AD%E6%96%87)
 
 ## English
 
-WSL Backup Manager v4.01 is a single-file Windows PowerShell tool for WSL2 backup and restore. It runs on Windows and calls Windows-side tools such as PowerShell, `wsl.exe`, WSL UNC paths, and 7-Zip. It is not a Linux/WSL shell script.
+WSL Backup Manager v4.1 is a single-file Windows PowerShell tool for WSL2 backup and restore. It runs on Windows and calls Windows-side tools such as PowerShell, `wsl.exe`, WSL UNC paths, and 7-Zip. It is not a Linux/WSL shell script.
 
 ### Key Features
 
@@ -18,12 +18,14 @@ WSL Backup Manager v4.01 is a single-file Windows PowerShell tool for WSL2 backu
 - Diagnostics / environment self-check.
 - DryRun mode for previewing high-risk operations.
 - Manifest, SHA256, and OperationId audit data.
-- Protected delete and guarded WSL operations.
+- Safety Net manifest and rollback confirmation for FULL overwrite restore failure handling.
+- Guarded native process execution with safer argument passing, timeout/cancel handling, and separated stdout/stderr capture.
+- Protected delete, guarded WSL operations, and improved disk/UNC preflight checks.
 
 ### Important Limitations
 
 - USER/CUSTOM backups use WSL UNC paths with Windows 7-Zip and do not guarantee full Linux metadata fidelity, including permissions, owner/group, or symlinks.
-- FULL overwrite restore is destructive and replaces the target distro.
+- FULL overwrite restore is always destructive even with Safety Net. Prefer clone restore validation before relying on overwrite recovery.
 - `wsl --shutdown` affects all running WSL2 distributions.
 - DryRun does not execute WSL or 7-Zip operations, but it also does not prove the real operation will succeed.
 - This script does not automatically write `.wslconfig`.
@@ -43,13 +45,13 @@ Config (`wsl-backup-config.json`), logs (`logs/`), and default backup/install di
 Run PowerShell from the project directory:
 
 ```powershell
-.\wsl-backup-manager_v4.01.ps1
+.\wsl-backup-manager_v4.1.ps1
 ```
 
 Preview high-risk operations with DryRun:
 
 ```powershell
-.\wsl-backup-manager_v4.01.ps1 -DryRun
+.\wsl-backup-manager_v4.1.ps1 -DryRun
 ```
 
 ### Recommended Workflow
@@ -68,7 +70,7 @@ Preview high-risk operations with DryRun:
 
 ## 中文
 
-WSL Backup Manager v4.01 是一个单文件 Windows PowerShell 工具，用于 WSL2 发行版的备份与恢复。它运行在 Windows 侧，会调用 PowerShell、`wsl.exe`、WSL UNC 路径和 7-Zip。它不是运行在 Linux/WSL 内部的 shell 脚本。
+WSL Backup Manager v4.1 是一个单文件 Windows PowerShell 工具，用于 WSL2 发行版的备份与恢复。它运行在 Windows 侧，会调用 PowerShell、`wsl.exe`、WSL UNC 路径和 7-Zip。它不是运行在 Linux/WSL 内部的 shell 脚本。
 
 ### 主要功能
 
@@ -82,12 +84,14 @@ WSL Backup Manager v4.01 是一个单文件 Windows PowerShell 工具，用于 W
 - Diagnostics / 环境自检。
 - DryRun 预览模式，用于预览高风险操作。
 - Manifest、SHA256 和 OperationId 审计信息。
-- 受保护删除和受保护的 WSL 操作。
+- Safety Net manifest 和 FULL 覆盖恢复失败后的 rollback 确认。
+- 带有更安全参数传递、timeout/cancel 和 stdout/stderr 分离捕获的 native process 执行。
+- 受保护删除、受保护的 WSL 操作，以及改进的磁盘/UNC preflight 检查。
 
 ### 重要限制
 
 - USER/CUSTOM 备份通过 WSL UNC 路径配合 Windows 7-Zip 处理，不保证完整保留 Linux 元数据，包括权限、owner/group 或 symlink。
-- FULL 覆盖恢复是破坏性操作，会替换目标发行版。
+- 即使有 Safety Net，FULL 覆盖恢复仍始终是破坏性操作；依赖覆盖恢复前应优先验证克隆恢复。
 - `wsl --shutdown` 会影响所有正在运行的 WSL2 发行版。
 - DryRun 不会执行真实 WSL 或 7-Zip 操作，但也不能证明真实操作一定会成功。
 - 本脚本不会自动写入 `.wslconfig`。
@@ -107,13 +111,13 @@ WSL Backup Manager v4.01 是一个单文件 Windows PowerShell 工具，用于 W
 在项目目录中打开 PowerShell：
 
 ```powershell
-.\wsl-backup-manager_v4.01.ps1
+.\wsl-backup-manager_v4.1.ps1
 ```
 
 使用 DryRun 预览高风险操作：
 
 ```powershell
-.\wsl-backup-manager_v4.01.ps1 -DryRun
+.\wsl-backup-manager_v4.1.ps1 -DryRun
 ```
 
 ### 推荐使用流程
